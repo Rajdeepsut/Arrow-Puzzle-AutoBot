@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-An autonomous agent that plays **Arrow Puzzle: Tap Puzzle Games** (Easybrain) on a
+HELLO DEv My self Rajdeep Sut i developed something cute .An autonomous agent that plays **Arrow Puzzle: Tap Puzzle Games** (Easybrain) on a
 real Android phone: it screenshots the board with ADB, reads every arrow with
 OpenCV, works out which arrows can leave the board without hitting anything, taps
 them, and repeats until the level is empty - then taps through to the next level

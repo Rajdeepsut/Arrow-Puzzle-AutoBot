@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # headless build: no X11/GTK needed on a runner
+          python -m pip install "numpy>=1.24" "opencv-python-headless>=4.8" "pytest>=7.0"
+
+      - name: Unit tests (puzzle rules)
+        run: python -m pytest -q
+
+      - name: Self-test (rules + vision + agent loop, no phone)
+        run: python main.py selftest
+
+      - name: CLI smoke test
+        run: |
+          python main.py --version
+          python main.py solve "R U . / D L U / . . R"
+          python main.py shot --image samples/sample_board.png
+          python main.py devices || true   # no adb on the runner; must fail cleanly

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arrow-puzzle-bot"
+version = "1.0.0"
+description = "Autonomous ADB + OpenCV bot that solves the Android game 'Arrow Puzzle' (Easybrain)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Rajdeep Sut" }]
+keywords = ["adb", "opencv", "android", "automation", "puzzle", "bot"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Games/Entertainment :: Puzzle Games",
+]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+arrowbot = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/Rajdeepsut/Arrow-Puzzle-AutoBot"
+Issues = "https://github.com/Rajdeepsut/Arrow-Puzzle-AutoBot/issues"
+
+[tool.setuptools]
+packages = ["arrowbot"]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

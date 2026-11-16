@@ -50,7 +50,7 @@ sweep per wave, and the loop terminates.
 
 ## Requirements
 
-* Python 3.9+ (tested on 3.13)
+* Python 3.9 - 3.13 (CI runs the whole suite on every version)
 * `numpy` and `opencv-python` (`pip install -r requirements.txt`)
 * Android platform-tools (`adb`) on your PATH, USB debugging enabled
 * The game open on a level
@@ -162,7 +162,7 @@ file with only the keys you want to change; unknown keys are ignored.
 | `on_deadlock` | `"stop"` | `stop` or `tap_anyway` (sacrifices a life and continues) |
 | `continue_on_failure` | `false` | keep going after a level that did not finish |
 | `max_levels` | `500` | how many levels to clear in this run |
-| `start_level` | `32` | label used in logs only |
+| `start_level` | `1` | label used in logs only (`config.json` ships `32`) |
 | `stop_on_error` | `false` | re-raise exceptions instead of stopping cleanly |
 | `write_debug` | `true` | write annotated images to `debug_dir` |
 | `debug_dir` | `"debug"` | where those images go |
@@ -247,18 +247,19 @@ arrowbot/
   selftest.py           43 end-to-end checks, no phone needed
 tests/test_solver.py    30 unit tests for the rules (pytest)
 samples/sample_board.png  a synthetic screenshot for `shot --image`
-.github/workflows/ci.yml  runs both test suites on Python 3.9 / 3.11 / 3.12 / 3.13
+.github/workflows/ci.yml  lint + both test suites on Python 3.9 / 3.11 / 3.12 / 3.13
 ```
 
 ## Tests
 
 ```bash
+ruff check .             # lint: dead code, undefined names, import order
 python -m pytest -q      # rules only, milliseconds
 python main.py selftest  # rules + vision + full agent loop, a few seconds
 ```
 
-Both suites run in CI on every push, across four Python versions, with no phone
-and no display attached.
+Lint and both suites run in CI on every push, across Python 3.9 / 3.11 / 3.12 /
+3.13, with no phone and no display attached.
 
 ## License
 

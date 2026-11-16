@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.6"]
 
 [project.scripts]
 arrowbot = "main:main"
@@ -39,3 +39,18 @@ py-modules = ["main"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+# Only rules that catch real mistakes (dead code, undefined names, likely bugs)
+# plus import order - deliberately not a bikeshed-style ruleset.
+[tool.ruff.lint]
+select = ["E9", "F", "B", "I"]
+ignore = [
+    "BLE001", # the agent intentionally catches Exception to keep playing
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["arrowbot"]

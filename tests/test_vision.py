@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import pathlib
+
+import cv2
 import pytest
 
+from arrowbot import solver
 from arrowbot.agent import ArrowAgent
 from arrowbot.config import Config
 from arrowbot.sim import SimGame
 from arrowbot.vision import Detector
+
+SAMPLES = pathlib.Path(__file__).resolve().parents[1] / "samples"
 
 
 def _truth(game: SimGame):
@@ -72,3 +78,23 @@ def test_a_fitted_view_is_not_pinched():
     detection = agent.ensure_zoom(agent.read_stable())
     assert detection is not None
     assert game.camera_zoom == 1.0
+
+
+@pytest.mark.parametrize("name,min_arrows,scale_at_least", [
+    ("real_level.png", 50, 1.2),          # fitted camera, the normal play state
+    ("real_level_zoomed.png", 70, 0.5),   # camera mid-adjustment, scale ~1.0
+])
+def test_real_game_frames_are_readable(name, min_arrows, scale_at_least):
+    """Captured from the real game: every arrow must be certain, and the board
+    must have a legal clear order (a deadlock here would mean a misread)."""
+    image = cv2.imread(str(SAMPLES / name))
+    assert image is not None, f"missing fixture {name}"
+    config = Config().validate()
+    detection = Detector(config).detect(image)
+
+    assert len(detection.arrows) >= min_arrows, detection.describe()
+    assert detection.scale >= scale_at_least
+    low = [arrow for arrow in detection.arrows
+           if arrow.confidence < config.min_direction_margin]
+    assert low == [], f"{len(low)} ambiguous arrows: {low[:3]}"
+    assert solver.order(detection.arrows) is not None

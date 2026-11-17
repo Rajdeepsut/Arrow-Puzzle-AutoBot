@@ -384,11 +384,11 @@ class ArrowAgent:
             return self.play_level_slow(level, dry_run=dry_run)
 
         first_count = len(detection.arrows)
-        batch_limit = self.config.batch_size
-        if self.config.adaptive_batches:
-            batch_limit = min(batch_limit, self.config.batch_size_start)
+        #: the first tap of a level is always sent alone, so the camera's actual
+        #: behaviour is measured before anything is batched
+        batch_limit = 1 if self.config.adaptive_batches else self.config.batch_size
         batches = int((first_count + batch_limit - 1) / batch_limit)
-        self.log.info("fast mode: %d arrows, batches of up to %d (start %d, ~%d screenshots)",
+        self.log.info("fast mode: %d arrows, up to %d per batch (start %d, ~%d screenshots)",
                       first_count, self.config.batch_size, batch_limit, batches)
 
         stalls = 0
@@ -466,17 +466,21 @@ class ArrowAgent:
 
             if self.config.adaptive_batches:
                 drift = self.camera_drift(before, detection)
-                if drift is not None and drift > self.config.batch_drift_px:
-                    # the camera is zooming or panning: shorter batches keep every
-                    # coordinate valid for fewer taps
-                    smaller = max(2, batch_limit // 2)
-                    if smaller < batch_limit:
-                        batch_limit = smaller
+                if drift is None:
+                    pass                      # too few survivors to judge
+                elif drift > self.config.batch_drift_px:
+                    # a moving camera invalidates coordinates within a batch: only
+                    # batch again once it has been seen standing still
+                    if drift > 2 * self.config.batch_drift_px:
+                        batch_limit = 1
+                    else:
+                        batch_limit = max(1, batch_limit // 2)
                     self.log.debug("camera moved %.1f px during the batch - batch size down to %d",
                                    drift, batch_limit)
-                elif batch_limit < self.config.batch_size:
-                    batch_limit = min(self.config.batch_size, batch_limit + 2)
-                    self.log.debug("camera steady - batch size up to %d", batch_limit)
+                else:
+                    batch_limit = min(self.config.batch_size,
+                                      max(self.config.batch_size_start, batch_limit * 2))
+                    self.log.debug("camera steady - next batch size %d", batch_limit)
 
             # the game zooms in as the board empties; if that pushed ink off the
             # board region, pinch back out before the next batch

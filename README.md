@@ -61,12 +61,12 @@ Because removal never creates a blocker, the complete greedy order can be
 computed once and executed as-is. Measurements on the real game at its default
 camera fit showed that after a tap **all 73 remaining arrow heads moved 0.0 px**
 and the artwork scale stayed at 1.60, so coordinates stay valid while a batch is
-being tapped. The bot still takes a screenshot between batches (6 arrows at
-first, growing to 8 while the camera stands still, shrinking again when a
-surviving head moves more than a few pixels) to catch a panned or zoomed
-camera, a lost heart, a stalled tap, or a popup. The simulator is harsher than
-the real game - it zooms in on every removal - and this batching scheme clears
-it without ever losing a heart.
+being tapped. The bot still takes a screenshot between batches (the first tap of
+a level is always sent alone, then 6 at a time, growing to 8 while the camera
+stands still and dropping back to one tap when a surviving head moves) to catch
+a panned or zoomed camera, a lost heart, a stalled tap, or a popup. The simulator
+is harsher than the real game - it zooms in on every removal - and this batching
+scheme clears it without ever losing a heart.
 
 ## Zoom-out at level start
 
@@ -168,8 +168,8 @@ If anything unusual happens, an annotated image is written to `debug/`
 1. wait for a stable first frame (two identical readings);
 2. zoom out if any arrow ink touches the board-region edge;
 3. read the whole board, plan the complete clear order once;
-4. tap the next batch (6 arrows, growing to 8 while the camera stands still) over
-   one persistent scrcpy socket
+4. tap the next batch (one probe tap first, then 6, growing to 8 while the
+   camera stands still) over one persistent scrcpy socket
    (down/up per arrow, ~6 ms apart, ~12 ms press);
 5. take one screenshot: check hearts, count, and that no new arrows appeared;
 6. repeat from step 3 until the board is empty;
@@ -199,8 +199,8 @@ unknown keys are ignored, so old files keep working.
 | `min_direction_margin` | `0.06` | template margin below which a direction is ambiguous |
 | `fast_mode` | `true` | plan once, tap batches |
 | `batch_size` | `8` | maximum arrows per screenshot in fast mode |
-| `batch_size_start` | `6` | first batch of a level (more conservative) |
-| `adaptive_batches` | `true` | grow to `batch_size` while the camera is still, shrink when it moves |
+| `batch_size_start` | `6` | batch size after the first tap proves the camera is still |
+| `adaptive_batches` | `true` | one probe tap first, then grow to `batch_size`; drop to 1 when the camera moves |
 | `batch_drift_px` | `3` | surviving-arrow movement that counts as "the camera moved" |
 | `batch_gap_ms` | `6` | pause between taps of one batch |
 | `tap_hold_ms` | `12` | press duration per arrow |
@@ -279,8 +279,9 @@ arrowbot/
   scrcpy.py               scrcpy server lifecycle + multi-touch protocol
   sim.py                  synthetic phone (boards, camera zoom, hearts)
   selftest.py             51 end-to-end checks, no phone needed
-tests/                    pytest: solver, vision/zoom, scrcpy packets
+tests/                    pytest: solver, vision/zoom, scrcpy packets, agent
 samples/sample_board.png  synthetic screenshot for `shot --image`
+samples/real_level*.png   real device captures used as vision regressions
 .github/workflows/ci.yml  lint + tests + selftest on Python 3.9/3.11/3.12/3.13
 ```
 

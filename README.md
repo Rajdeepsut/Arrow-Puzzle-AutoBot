@@ -62,7 +62,8 @@ computed once and executed as-is. Measurements on the real game at its default
 camera fit showed that after a tap **all 73 remaining arrow heads moved 0.0 px**
 and the artwork scale stayed at 1.60, so coordinates stay valid while a batch is
 being tapped. The bot still takes a screenshot between batches (6 arrows at
-first, growing to 8 while the camera stands still) to catch a panned or zoomed
+first, growing to 8 while the camera stands still, shrinking again when a
+surviving head moves more than a few pixels) to catch a panned or zoomed
 camera, a lost heart, a stalled tap, or a popup. The simulator is harsher than
 the real game - it zooms in on every removal - and this batching scheme clears
 it without ever losing a heart.
@@ -199,7 +200,7 @@ unknown keys are ignored, so old files keep working.
 | `fast_mode` | `true` | plan once, tap batches |
 | `batch_size` | `8` | maximum arrows per screenshot in fast mode |
 | `batch_size_start` | `6` | first batch of a level (more conservative) |
-| `adaptive_batches` | `true` | grow the batch back to `batch_size` while the camera is still |
+| `adaptive_batches` | `true` | grow to `batch_size` while the camera is still, shrink when it moves |
 | `batch_drift_px` | `3` | surviving-arrow movement that counts as "the camera moved" |
 | `batch_gap_ms` | `6` | pause between taps of one batch |
 | `tap_hold_ms` | `12` | press duration per arrow |

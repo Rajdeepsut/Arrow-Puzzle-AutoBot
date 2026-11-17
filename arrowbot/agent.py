@@ -467,7 +467,12 @@ class ArrowAgent:
             if self.config.adaptive_batches:
                 drift = self.camera_drift(before, detection)
                 if drift is not None and drift > self.config.batch_drift_px:
-                    self.log.debug("camera moved %.1f px during the batch - keeping %d taps",
+                    # the camera is zooming or panning: shorter batches keep every
+                    # coordinate valid for fewer taps
+                    smaller = max(2, batch_limit // 2)
+                    if smaller < batch_limit:
+                        batch_limit = smaller
+                    self.log.debug("camera moved %.1f px during the batch - batch size down to %d",
                                    drift, batch_limit)
                 elif batch_limit < self.config.batch_size:
                     batch_limit = min(self.config.batch_size, batch_limit + 2)

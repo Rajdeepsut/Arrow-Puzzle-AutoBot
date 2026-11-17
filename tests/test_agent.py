@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import pytest
 
 from arrowbot.agent import ArrowAgent
 from arrowbot.config import Config
 from arrowbot.sim import SimGame
+from arrowbot.vision import Detector
 
 
 def _config(levels: int) -> Config:
@@ -87,3 +89,18 @@ def test_batch_taps_are_safe_on_a_tight_board():
     assert stats.levels_cleared == 1, stats.summary()
     assert game.lives_lost == 0
     assert stats.taps >= arrows
+
+
+def test_camera_drift_sees_a_moved_board():
+    config = _config(1)
+    game = SimGame(config, cols=11, rows=13, seed=3)
+    agent = ArrowAgent(config, game, logger=_logger())
+    detector = Detector(config)
+    before = detector.detect(game.screencap())
+
+    assert agent.camera_drift(before, before) == pytest.approx(0.0)
+
+    shifted = replace(before, arrows=[replace(arrow, head=(arrow.cx + 7, arrow.cy + 5))
+                                      for arrow in before.arrows])
+    drift = agent.camera_drift(before, shifted)
+    assert drift is not None and drift > config.batch_drift_px

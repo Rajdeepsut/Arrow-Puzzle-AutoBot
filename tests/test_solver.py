@@ -1,118 +1,128 @@
-"""Unit tests for the pure solver (no OpenCV, no phone).
-
-    pytest -q
-"""
+"""Unit tests for the pure pixel-corridor solver (no phone, no screenshots)."""
 
 from __future__ import annotations
 
 import random
 
-import pytest
-
 from arrowbot import solver
+from arrowbot.config import Config
+from arrowbot.sim import PITCH, SimArrow, SimGame, arrow_mask
+from arrowbot.vision import VECTORS
 
 
-def test_open_lane_is_safe():
-    board = solver.parse_ascii("U...")
-    assert solver.is_safe(board, (0, 0))
-    assert solver.blockers(board, (0, 0)) == []
+def make_arrow(head, direction, cells: int = 2) -> SimArrow:
+    """A straight pixel arrow whose head is at ``head``."""
+    vx, vy = VECTORS[direction]
+    points = [(head[0] - vx * PITCH * (cells - k), head[1] - vy * PITCH * (cells - k))
+              for k in range(cells + 1)]
+    xs, ys, _ = arrow_mask(points, points[-1], direction)
+    return SimArrow(points, direction, xs, ys)
 
 
-def test_empty_cells_do_not_hide_a_blocker():
-    """Regression: rays must travel *through* empty cells, not stop at them."""
-    board = solver.parse_ascii(
-        """
-        D
-        .
-        U
-        """
-    )
-    assert board == {(0, 0): "D", (2, 0): "U"}
-    assert solver.blockers(board, (0, 0)) == [(2, 0)]
-    assert not solver.is_safe(board, (0, 0))
-    assert solver.plan(board) is None
+def test_a_lone_arrow_is_free():
+    arrow = make_arrow((300, 300), "U")
+    assert solver.is_safe(arrow, [arrow])
+    assert solver.blockers(arrow, [arrow]) == []
 
 
-def test_only_the_arrow_in_front_blocks_the_lane():
-    board = solver.parse_ascii("L.L")  # both point left
-    assert solver.blockers(board, (0, 0)) == []  # nothing left of column 0
-    assert solver.blockers(board, (0, 2)) == [(0, 0)]
-    assert solver.safe_cells(board) == [(0, 0)]
+def test_an_arrow_in_front_blocks():
+    back = make_arrow((300, 300), "U")
+    front = make_arrow((300, 300 - 3 * PITCH), "U")
+    assert not solver.is_safe(back, [back, front])
+    assert solver.is_safe(front, [back, front])
 
 
-def test_chain_clears_one_arrow_at_a_time():
-    board = solver.parse_ascii(
-        """
-        U
-        U
-        U
-        U
-        """
-    )
-    waves = solver.plan(board)
-    assert waves == [[(0, 0)], [(1, 0)], [(2, 0)], [(3, 0)]]
-    assert solver.simulate(board, waves)
+def test_an_arrow_behind_does_not_block():
+    up = make_arrow((300, 300), "U")
+    behind = make_arrow((300, 300 + 3 * PITCH), "D")
+    assert solver.is_safe(up, [up, behind])
 
 
-def test_wave_can_tap_everything_at_once():
-    board = solver.parse_ascii(
-        """
-        U U U
-        . . .
-        D D D
-        """
-    )
-    waves = solver.plan(board)
-    assert waves is not None and len(waves) == 1
-    assert len(waves[0]) == 6
+def test_an_arrow_beside_the_corridor_does_not_block():
+    up = make_arrow((300, 300), "U")
+    side = make_arrow((300 + 3 * PITCH, 300), "U")
+    assert solver.is_safe(up, [up, side])
 
 
 def test_perpendicular_arrows_do_not_block_each_other():
-    board = solver.parse_ascii(
-        """
-        R . .
-        . . .
-        . . U
-        """
-    )
-    assert set(solver.safe_cells(board)) == {(0, 0), (2, 2)}
+    up = make_arrow((300, 300), "U")
+    left = make_arrow((500, 500), "L")
+    assert solver.is_safe(up, [up, left])
+    assert solver.is_safe(left, [up, left])
 
 
-def test_unknown_direction_is_never_tappable():
-    board = {(0, 0): "?", (0, 1): "U"}
-    assert not solver.is_safe(board, (0, 0))
-    assert solver.safe_cells(board) == [(0, 1)]
+def test_a_chain_clears_from_the_front():
+    chain = [make_arrow((300, 300 + PITCH * k), "U") for k in range(4)]
+    safe = solver.safe_arrows(chain)
+    assert [id(arrow) for arrow in safe] == [id(chain[0])]
+    waves = solver.plan(chain)
+    assert waves is not None and len(waves) == 4
+    assert sum(len(wave) for wave in waves) == len(chain)
 
 
-def test_text_round_trip():
-    text = "U . R\n. D .\nL . R"
-    board = solver.parse_ascii(text)
-    assert len(board) == 5
-    assert solver.format_ascii(board) == text
+def test_a_ring_of_four_arrows_is_a_deadlock():
+    a = make_arrow((100, 100), "R")
+    b = make_arrow((200, 100), "D")
+    c = make_arrow((200, 200), "L")
+    d = make_arrow((100, 200), "U")
+    ring = [a, b, c, d]
+    assert solver.safe_arrows(ring) == []
+    assert solver.plan(ring) is None
 
 
-def test_glyph_aliases():
-    board = solver.parse_ascii("^>v<")
-    assert list(board.values()) == ["U", "R", "D", "L"]
+def test_the_corridor_scales_with_the_artwork():
+    doubled = make_arrow((300, 300), "U")
+    doubled.scale = 2.0
+    near = make_arrow((300 + 10, 300 - 2 * PITCH), "U")
+    assert solver.is_safe(doubled, [doubled, near]) is False
 
 
-@pytest.mark.parametrize("seed", range(20))
-def test_random_boards_are_planned_legally(seed: int):
-    rng = random.Random(seed)
-    rows, cols = rng.randint(3, 9), rng.randint(3, 9)
-    board = solver.random_solvable_board(rows, cols, rng)
-    waves = solver.plan(board)
-    assert waves is not None, f"generator produced an unsolvable {rows}x{cols} board"
-    assert solver.simulate(board, waves)
-    assert all(wave for wave in waves)
-    assert sum(len(wave) for wave in waves) == len(board)
+def test_order_taps_every_arrow_once_and_stays_safe():
+    chain = [make_arrow((300, 300 + PITCH * k), "U") for k in range(6)]
+    order = solver.order(chain)
+    assert order is not None and len(order) == len(chain)
+    alive = list(chain)
+    for arrow in order:
+        assert solver.is_safe(arrow, alive)
+        alive.remove(arrow)
+    assert not alive
 
 
-def test_plan_never_suggests_a_blocked_tap():
-    rng = random.Random(7)
-    for _ in range(50):
-        board = solver.random_solvable_board(6, 6, rng)
-        work = dict(board)
-        for cell in solver.safe_cells(work):
-            assert solver.is_safe(work, cell)
-            work.pop(cell)
+def test_plans_are_valid_on_generated_boards():
+    """Every generated board must be clearable, and each tap safe when made."""
+    config = Config()
+    for seed in range(8):
+        game = SimGame(config, cols=9, rows=11, seed=seed)
+        order = solver.order(game.board)
+        assert order is not None, f"seed {seed} generated a dead board"
+        alive = list(game.board)
+        for arrow in order:
+            assert solver.is_safe(arrow, alive)
+            alive.remove(arrow)
+        assert not alive
+
+
+def test_random_pixel_arrows_never_produce_an_illegal_plan():
+    rng = random.Random(11)
+    for _ in range(5):
+        width, height = 12, 12
+        arrows = []
+        used = set()
+        for _ in range(25):
+            row, column = rng.randrange(height), rng.randrange(width)
+            step = rng.choice(((1, 0), (-1, 0), (0, 1), (0, -1)))
+            if (row, column) in used or not (0 <= row + 2 * step[0] < height
+                                             and 0 <= column + 2 * step[1] < width):
+                continue
+            direction = ("D" if step[0] > 0 else "U") if step[0] else ("R" if step[1] > 0 else "L")
+            head = ((column + 2 * step[1]) * PITCH + PITCH / 2,
+                    (row + 2 * step[0]) * PITCH + PITCH / 2)
+            arrows.append(make_arrow(head, direction))
+            used.add((row, column))
+        order = solver.order(arrows)
+        if order is None:
+            continue
+        alive = list(arrows)
+        for arrow in order:
+            assert solver.is_safe(arrow, alive)
+            alive.remove(arrow)

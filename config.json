@@ -1,27 +1,84 @@
 {
   "adb_path": "adb",
   "serial": null,
-  "roi": [0.0, 0.1, 1.0, 0.9],
+  "input_backend": "scrcpy",
+  "scrcpy_jar": null,
+  "scrcpy_port": 27183,
+  "scrcpy_log_level": "error",
+  "roi": [
+    0.0,
+    0.14,
+    1.0,
+    0.79
+  ],
   "exclude_rects": [],
-  "min_blob_area_frac": 4e-05,
-  "max_blob_area_frac": 0.06,
-  "morph_close": 3,
-  "spacing_tolerance": 0.22,
-  "min_orientation_confidence": 0.6,
-  "tap_delay_ms": 140,
-  "chunk_size": 3,
-  "settle_timeout_ms": 3500,
-  "settle_poll_ms": 120,
-  "settle_thresh": 2.0,
+  "ink_gray_max": 110,
+  "red_ink": true,
+  "scale_range": [
+    0.5,
+    4.0
+  ],
+  "min_direction_margin": 0.06,
+  "min_arrow_pixels": 60,
+  "min_head_pixels": null,
+  "fast_mode": true,
+  "batch_size": 8,
+  "batch_size_start": 6,
+  "batch_drift_px": 3,
+  "adaptive_batches": true,
+  "batch_gap_ms": 6,
+  "tap_hold_ms": 12,
+  "batch_wait_ms": 160,
+  "chunk_size": 1,
+  "tap_delay_ms": 0,
+  "tap_wait_ms": 700,
+  "settle_poll_ms": 140,
+  "settle_timeout_ms": 5000,
+  "stability_tol_px": 2,
+  "verify_taps": true,
   "tap_retries": 2,
+  "edge_margin_px": 18,
+  "hearts_roi": [
+    0.31,
+    0.095,
+    0.72,
+    0.132
+  ],
+  "hearts_min_red": 300,
+  "auto_zoom": true,
+  "zoom_center": [
+    0.5,
+    0.45
+  ],
+  "zoom_start_gap_px": 280,
+  "zoom_end_gap_px": 70,
+  "zoom_steps": 8,
+  "zoom_duration_ms": 180,
+  "zoom_attempts": 3,
+  "zoom_settle_ms": 450,
+  "zoom_edge_px": 3,
   "max_waves_per_level": 400,
+  "advance_timeout_ms": 20000,
   "advance_attempts": 6,
   "advance_wait_ms": 900,
-  "next_tap_points": [[0.5, 0.86], [0.5, 0.8], [0.5, 0.91]],
+  "next_tap_points": [
+    [
+      0.5,
+      0.86
+    ],
+    [
+      0.5,
+      0.8
+    ],
+    [
+      0.5,
+      0.91
+    ]
+  ],
   "on_deadlock": "stop",
   "continue_on_failure": false,
   "max_levels": 500,
-  "start_level": 32,
+  "start_level": 33,
   "stop_on_error": false,
   "write_debug": true,
   "debug_dir": "debug"

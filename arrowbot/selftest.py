@@ -1,28 +1,28 @@
-"""End-to-end self-test: needs no phone, no game install, no assets.
+﻿"""End-to-end self-test: needs no phone, no game install, no assets.
 
-It checks three things:
+Four things are checked:
 
-1. the ray-casting rules on hand written boards,
-2. the vision pipeline against synthetic screens it has never seen
-   (several grid sizes, both polarities, half-empty boards),
-3. the full agent loop against :class:`arrowbot.sim.SimGame` - and it asserts
-   that the bot *never lost a life* while clearing several levels.
+1. the corridor rules on hand-built pixel arrows,
+2. the vision pipeline against synthetic boards it has never seen (several board
+   sizes, dark ink, red ink, a zoomed camera, one arrow left),
+3. the full agent loop against :class:`arrowbot.sim.SimGame`, asserting that the
+   bot *never lost a heart* and did advance to the next level,
+4. that a board which never stops moving is never tapped.
 """
 
 from __future__ import annotations
 
 import logging
-import random
 import time
-from typing import Dict, List, Tuple
+from typing import List, Sequence, Tuple
+
+import numpy as np
 
 from . import solver
 from .agent import ArrowAgent
 from .config import Config
-from .sim import SimGame
-from .vision import Detector
-
-Cell = Tuple[int, int]
+from .sim import PITCH, SimArrow, SimGame, arrow_mask
+from .vision import VECTORS, Detector
 
 
 class Reporter:
@@ -52,14 +52,6 @@ class Reporter:
         return True
 
 
-def _normalise(cells: Dict[Cell, str]) -> Dict[Cell, str]:
-    if not cells:
-        return {}
-    rmin = min(r for r, _ in cells)
-    cmin = min(c for _, c in cells)
-    return {(r - rmin, c - cmin): d for (r, c), d in cells.items()}
-
-
 def _quiet_logger() -> logging.Logger:
     logger = logging.getLogger("arrowbot.selftest")
     logger.handlers = [logging.NullHandler()]
@@ -68,252 +60,286 @@ def _quiet_logger() -> logging.Logger:
     return logger
 
 
+def make_arrow(head: Tuple[int, int], direction: str, cells: int = 2) -> SimArrow:
+    """A straight pixel arrow whose head is at ``head``."""
+    vx, vy = VECTORS[direction]
+    points = [(head[0] - vx * PITCH * (cells - k), head[1] - vy * PITCH * (cells - k))
+              for k in range(cells + 1)]
+    xs, ys, _ = arrow_mask(points, points[-1], direction)
+    return SimArrow(points, direction, xs, ys)
+
+
 # --------------------------------------------------------------------------- #
 # 1. rules
 # --------------------------------------------------------------------------- #
 def test_rules(rep: Reporter) -> None:
-    board = solver.parse_ascii(
-        """
-        U . .
-        . . .
-        . D .
-        """
-    )
-    rep.check("parser reads a board", len(board) == 2, str(board))
-    rep.check(
-        "open lanes are safe",
-        set(solver.safe_cells(board)) == {(0, 0), (2, 1)},
-        str(solver.safe_cells(board)),
-    )
+    alone = make_arrow((300, 300), "U")
+    rep.check("a lone arrow is free", solver.is_safe(alone, [alone]))
+    rep.check("blockers of a lone arrow is empty", solver.blockers(alone, [alone]) == [])
 
-    blocked = solver.parse_ascii(
-        """
-        . D .
-        . . .
-        . U .
-        """
-    )
-    rep.check("facing arrows block each other", solver.safe_cells(blocked) == [])
-    rep.check("hopeless board reports a deadlock", solver.plan(blocked) is None)
+    up = make_arrow((300, 300), "U")
+    front = make_arrow((300, 300 - 3 * PITCH), "U")
+    rep.check("an arrow in front blocks", not solver.is_safe(up, [up, front]))
+    rep.check("the arrow in front is free", solver.is_safe(front, [up, front]))
 
-    chain = solver.parse_ascii("U\nU\nU\nU")
+    behind = make_arrow((300, 300 + 3 * PITCH), "D")
+    rep.check("an arrow behind does not block", solver.is_safe(up, [up, behind]))
+
+    side = make_arrow((300 + 3 * PITCH, 300), "U")
+    rep.check("an arrow beside the corridor does not block",
+              solver.is_safe(up, [up, side]))
+
+    left = make_arrow((500, 500), "L")
+    rep.check("perpendicular arrows do not block each other",
+              solver.is_safe(up, [up, left]) and solver.is_safe(left, [up, left]))
+
+    chain = [make_arrow((300, 300 + PITCH * k), "U") for k in range(4)]
+    safe = solver.safe_arrows(chain)
+    rep.check("a chain clears from the front", [id(a) for a in safe] == [id(chain[0])],
+              str([str(a) for a in safe]))
     waves = solver.plan(chain)
-    rep.check(
-        "chain clears one arrow per wave",
-        waves == [[(0, 0)], [(1, 0)], [(2, 0)], [(3, 0)]],
-        str(waves),
-    )
-    rep.check("plan validates legally", bool(waves) and solver.simulate(chain, waves))
+    rep.check("a chain needs one wave per arrow", waves is not None and len(waves) == 4,
+              str(waves))
+    rep.check("the plan taps every arrow once",
+              waves is not None and sum(len(wave) for wave in waves) == len(chain))
 
-    wide = solver.parse_ascii(
-        """
-        R R R
-        R R R
-        R R R
-        """
-    )
-    plan = solver.plan(wide)
-    rep.check(
-        "an all-right board clears one column at a time",
-        plan
-        == [
-            [(0, 2), (1, 2), (2, 2)],
-            [(0, 1), (1, 1), (2, 1)],
-            [(0, 0), (1, 0), (2, 0)],
-        ],
-        str(plan),
-    )
+    # four arrows chasing each other's tails: a genuine deadlock
+    a = make_arrow((100, 100), "R")
+    b = make_arrow((200, 100), "D")
+    c = make_arrow((200, 200), "L")
+    d = make_arrow((100, 200), "U")
+    ring = [a, b, c, d]
+    rep.check("a ring of four arrows locks up", solver.safe_arrows(ring) == [],
+              str([str(x) for x in solver.safe_arrows(ring)]))
+    rep.check("a deadlock is reported as such", solver.plan(ring) is None)
 
-    mixed = solver.parse_ascii(
-        """
-        R . D
-        . U .
-        L . R
-        """
-    )
-    plan = solver.plan(mixed)
-    rep.check("mixed board is solvable", plan is not None and solver.simulate(mixed, plan))
-    rep.check(
-        "mixed board needs several waves",
-        plan is not None and sum(len(w) for w in plan) == 5,
-        str(plan),
-    )
-
-    rng = random.Random(4)
-    solvable = solver.random_solvable_board(7, 7, rng)
-    rep.check(
-        "constructed boards are solvable",
-        solver.plan(solvable) is not None,
-        f"{len(solvable)} arrows",
-    )
-    rep.check(
-        "constructed boards are reasonably dense",
-        len(solvable) >= 0.7 * 49,
-        f"{len(solvable)}/49 arrows",
-    )
+    doubled = make_arrow((300, 300), "U")
+    doubled.scale = 2.0
+    near = make_arrow((300 + 10, 300 - 2 * PITCH), "U")
+    rep.check("the corridor scales with the artwork",
+              solver.is_safe(doubled, [doubled, near]) is False)
 
 
 # --------------------------------------------------------------------------- #
 # 2. vision
 # --------------------------------------------------------------------------- #
-def _vision_case(
-    rep: Reporter,
-    rows: int,
-    cols: int,
-    seed: int = 1,
-    drop: float = 0.0,
-    dark: bool = False,
-) -> None:
-    cfg = Config()
-    kwargs = {}
-    if dark:
-        kwargs = {"background": (32, 32, 38), "foreground": (240, 240, 240)}
-    game = SimGame(cfg, rows=rows, cols=cols, seed=seed, **kwargs)
+def _truth(game: SimGame) -> List[Tuple[int, int, str]]:
+    return [(int(round(game.to_screen(*arrow.path[-1])[0])),
+             int(round(game.to_screen(*arrow.path[-1])[1])),
+             arrow.direction) for arrow in game.board]
 
-    if drop > 0.0:
-        rng = random.Random(seed + 991)
-        interior = [
-            (r, c) for (r, c) in game.board
-            if 0 < r < rows - 1 and 0 < c < cols - 1
-        ]
-        for cell in rng.sample(interior, int(len(interior) * drop)):
-            del game.board[cell]
 
-    image = game.screencap()
-    detection = Detector(cfg).detect(image)
-    got = _normalise(detection.cells)
-    want = _normalise(game.board)
-
-    suffix = ""
-    if drop:
-        suffix += f", {int(drop * 100)}% cleared"
-    if dark:
-        suffix += ", dark theme"
-
-    ok = got == want
-    detail = ""
-    if not ok:
-        missing = sorted(set(want) - set(got))[:6]
-        extra = sorted(set(got) - set(want))[:6]
-        wrong = [(c, want[c], got[c]) for c in sorted(set(want) & set(got)) if want[c] != got[c]][:6]
-        detail = f"missing={missing} extra={extra} wrong={wrong} ({detection.describe()})"
-    rep.check(f"vision {rows}x{cols}{suffix}", ok, detail)
-
-    if not detection.arrows:
-        rep.check(f"tap points {rows}x{cols}{suffix}", False, "no arrows detected")
-        return
-
-    hits = [game.cell_at(*a.tap_point()) for a in detection.arrows]
-    rep.check(
-        f"tap points land in distinct cells {rows}x{cols}{suffix}",
-        all(h is not None for h in hits) and len(set(hits)) == len(hits),
-        f"{sum(h is None for h in hits)} misses",
-    )
-    confidences = [a.confidence for a in detection.arrows]
-    rep.check(
-        f"orientation confidence {rows}x{cols}{suffix}",
-        min(confidences) >= 0.6,
-        f"min={min(confidences):.2f}",
-    )
+def _compare(rep: Reporter, name: str, game: SimGame, detector: Detector,
+             truth: Sequence[Tuple[int, int, str]]) -> bool:
+    detection = detector.detect(game.screencap())
+    matched = wrong = missing = 0
+    for x, y, direction in truth:
+        near = [arrow for arrow in detection.arrows
+                if abs(arrow.cx - x) <= 7 and abs(arrow.cy - y) <= 7]
+        if not near:
+            missing += 1
+            continue
+        matched += 1
+        wrong += near[0].direction != direction
+    extra = len(detection.arrows) - matched
+    ok = missing == 0 and wrong == 0 and extra == 0
+    rep.check(name, ok,
+              f"missing={missing} wrong={wrong} extra={extra} ({detection.describe()})")
+    if ok and detection.arrows:
+        margins = min(arrow.confidence for arrow in detection.arrows)
+        rep.check(f"{name}: directions are unambiguous", margins >= 0.06, f"min={margins:.2f}")
+    return ok
 
 
 def test_vision(rep: Reporter) -> None:
-    for rows, cols in ((5, 5), (6, 6), (7, 7), (8, 8), (6, 7)):
-        _vision_case(rep, rows, cols, seed=rows * 31 + cols)
-    _vision_case(rep, 6, 6, seed=5, drop=0.5)
-    _vision_case(rep, 8, 8, seed=9, drop=0.35)
-    _vision_case(rep, 6, 6, seed=11, dark=True)
-    test_end_game(rep)
-
-
-def test_end_game(rep: Reporter) -> None:
-    """The last two arrows of a level must still be found and read correctly."""
     cfg = Config()
-    game = SimGame(cfg, rows=6, cols=6, seed=33)
     detector = Detector(cfg)
+    for cols, rows, seed in ((11, 13, 1), (9, 10, 2), (14, 16, 3), (6, 6, 4)):
+        game = SimGame(cfg, cols=cols, rows=rows, seed=seed)
+        _compare(rep, f"vision {cols}x{rows}", game, detector, _truth(game))
 
-    full = detector.detect(game.screencap())
-    rep.check("end game: full board seen first", len(full) >= 20, full.describe())
+    game = SimGame(cfg, cols=11, rows=13, seed=5)
+    red = SimGame(cfg, cols=11, rows=13, seed=5, foreground=(40, 40, 210))
+    _compare(rep, "vision: red arrows", red, detector, _truth(red))
+    _compare(rep, "vision: navy arrows", game, detector, _truth(game))
 
-    for keep in (2, 1):
-        intact = {cell: direction for cell, direction in game.board.items()}
-        chosen = sorted(intact)[:keep]
-        game.board = {cell: intact[cell] for cell in chosen}
-        detection = detector.detect(game.screencap())
-        ok = len(detection.arrows) == keep and _normalise(detection.cells) == _normalise(game.board)
-        rep.check(
-            f"end game: {keep} arrow(s) left are still detected",
-            ok,
-            f"{detection.describe()} expected={_normalise(game.board)} got={_normalise(detection.cells)}",
-        )
-        game.board = intact
+    # the camera zooms in as the board empties - the model must follow
+    game = SimGame(cfg, cols=11, rows=13, seed=6)
+    full = len(game.board)
+    for keep in (max(1, full // 2), 4, 1, 0):
+        game.board = game.board[:keep]
+        if not game.board:
+            break
+        _compare(rep, f"vision: zoomed, {keep} arrows left", game, detector, _truth(game))
+
+    # tap points must sit on the arrow they belong to
+    game = SimGame(cfg, cols=11, rows=13, seed=7)
+    detection = detector.detect(game.screencap())
+    hits = 0
+    for arrow in detection.arrows:
+        x, y = arrow.tap_point()
+        hits += int(detection.mask[y, x] > 0)
+    rep.check("tap points land on ink", hits == len(detection.arrows),
+              f"{hits}/{len(detection.arrows)}")
+
+    # a moving board must be recognised as a different view
+    first = detector.detect(game.screencap())
+    second = detector.detect(game.screencap())
+    rep.check("identical frames count as the same view", first.same_view(second))
+    game.board = game.board[1:]
+    third = detector.detect(game.screencap())
+    rep.check("one arrow fewer is a different view", not first.same_view(third))
+    rep.check("a detection knows its own signature", isinstance(first.signature(), tuple))
 
 
 # --------------------------------------------------------------------------- #
 # 3. the real thing, minus the phone
 # --------------------------------------------------------------------------- #
 def _fast_config(levels: int) -> Config:
-    """A config tuned for the simulator: no real sleeps, no debug images."""
     cfg = Config()
     cfg.write_debug = False
     cfg.max_levels = levels
-    cfg.chunk_size = 3
-    cfg.tap_delay_ms = 0
-    cfg.settle_poll_ms = 1
-    cfg.settle_timeout_ms = 60
-    cfg.advance_wait_ms = 120
+    cfg.fast_mode = True
+    cfg.batch_size = 8
+    cfg.batch_gap_ms = 0
+    cfg.batch_wait_ms = 0
+    cfg.tap_hold_ms = 0
+    cfg.zoom_settle_ms = 0
+    cfg.chunk_size = 1
+    cfg.tap_wait_ms = 0
+    cfg.settle_poll_ms = 10
+    cfg.settle_timeout_ms = 3000
+    cfg.advance_wait_ms = 50
+    cfg.advance_timeout_ms = 5000
+    cfg.advance_attempts = 0
     return cfg
 
 
 def test_agent(rep: Reporter, levels: int = 3) -> None:
     cfg = _fast_config(levels)
-    game = SimGame(cfg, rows=6, cols=6, seed=21)
+    game = SimGame(cfg, cols=11, rows=13, seed=21)
     agent = ArrowAgent(cfg, game, logger=_quiet_logger())
     stats = agent.run()
 
-    rep.check(
-        f"agent cleared {levels} simulated levels",
-        stats.levels_cleared == levels,
-        stats.summary(),
-    )
-    rep.check(
-        "agent never lost a life",
-        game.lives_lost == 0,
-        f"{game.lives_lost} arrows were tapped while blocked",
-    )
-    rep.check(
-        "agent advanced past the win screen",
-        game.level >= levels + 1,
-        f"sim level counter is {game.level}",
-    )
+    rep.check(f"agent cleared {levels} simulated levels",
+              stats.levels_cleared == levels, stats.summary())
+    rep.check("agent never lost a heart", game.lives_lost == 0,
+              f"{game.lives_lost} wrong taps")
+    rep.check("agent advanced past the win screen", game.level >= levels + 1,
+              f"sim level counter is {game.level}")
+    rep.check("every simulated level cleared in under a minute",
+              len(stats.level_times) == levels and max(stats.level_times) < 60.0,
+              f"times={['%.1f' % t for t in stats.level_times]}")
+
+
+def test_zoom_out(rep: Reporter, levels: int = 1) -> None:
+    """A camera left zoomed in must be pinched back out before any tap."""
+    cfg = _fast_config(levels)
+    game = SimGame(cfg, cols=11, rows=13, seed=31)
+    full = len(game.board)
+    game.camera_zoom = 2.8
+    detector = Detector(cfg)
+    clipped = detector.detect(game.screencap())
+    rep.check("a zoomed-in camera clips the board", len(clipped.arrows) < full,
+              f"{len(clipped.arrows)}/{full} arrows visible")
+
+    agent = ArrowAgent(cfg, game, logger=_quiet_logger())
+    fitted = agent.ensure_zoom(clipped)
+    rep.check("zoom-out brings the whole board back",
+              fitted is not None and not agent.board_clipped(fitted)
+              and len(fitted.arrows) == full,
+              fitted.describe() if fitted else "no detection")
+    rep.check("zoom-out reaches the game's fitted camera",
+              abs(game.camera_zoom - 1.0) < 0.01, f"camera_zoom={game.camera_zoom:.2f}")
 
 
 class _ShiftingSim(SimGame):
-    """Emulates the real game: later levels use a different grid size."""
+    """Emulates the real game: later levels use a different board size."""
 
-    def _advance(self) -> None:
-        if time.monotonic() - self._win_at < 0.2:
+    def _maybe_advance(self) -> None:
+        if self._cleared_at is None:
+            self._cleared_at = time.monotonic()
+            return
+        if time.monotonic() - self._cleared_at < self.advance_delay:
             return
         self.level += 1
-        self.reshape(self.rng.randint(4, 9), self.rng.randint(4, 9))
+        self._cleared_at = None
+        self.reshape(self.rng.randint(7, 13), self.rng.randint(8, 14))
 
 
-def test_grid_changes(rep: Reporter, levels: int = 5) -> None:
+def test_board_changes(rep: Reporter, levels: int = 3) -> None:
     cfg = _fast_config(levels)
-    game = _ShiftingSim(cfg, rows=5, cols=5, seed=77)
+    game = _ShiftingSim(cfg, cols=9, rows=11, seed=77)
     agent = ArrowAgent(cfg, game, logger=_quiet_logger())
     stats = agent.run()
+    rep.check(f"agent survives {levels} board size changes",
+              stats.levels_cleared == levels, stats.summary())
+    rep.check("no hearts lost while the board resized", game.lives_lost == 0,
+              f"{game.lives_lost} wrong taps")
 
-    rep.check(
-        f"agent survives {levels} grid size changes",
-        stats.levels_cleared == levels,
-        stats.summary(),
-    )
-    rep.check(
-        "no lives lost while the grid resized",
-        game.lives_lost == 0,
-        f"{game.lives_lost} blocked taps",
-    )
+
+# --------------------------------------------------------------------------- #
+# 4. the scrcpy wire format (no phone needed)
+# --------------------------------------------------------------------------- #
+def test_scrcpy_packets(rep: Reporter) -> None:
+    import struct
+
+    from .scrcpy import ACTION_DOWN, ACTION_UP, MSG_TOUCH, ScrcpyControl
+
+    control = ScrcpyControl()
+    packets: List[bytes] = []
+    control._send = packets.append          # type: ignore[method-assign]
+    control.tap(120, 240)
+    rep.check("a tap is exactly two 32-byte touch messages",
+              len(packets) == 2 and all(len(packet) == 32 for packet in packets),
+              f"sizes={[len(packet) for packet in packets]}")
+
+    def fields(packet: bytes):
+        return struct.unpack(">BBqiiHHHII", packet)
+
+    down, up = (fields(packet) for packet in packets)
+    rep.check("scrcpy down packet is a touch-down at the tapped point",
+              down[0] == MSG_TOUCH and down[1] == ACTION_DOWN and down[2] == 0
+              and (down[3], down[4]) == (120, 240), str(down))
+    rep.check("scrcpy up packet releases the same pointer",
+              up[0] == MSG_TOUCH and up[1] == ACTION_UP and up[2] == 0
+              and (up[3], up[4]) == (120, 240), str(up))
+
+    packets.clear()
+    count = control.tap_many([(10, 20), (30, 40), (50, 60)], gap_ms=0)
+    rep.check("tap_many sends one down/up pair per arrow",
+              count == 3 and len(packets) == 6
+              and [packet[1] for packet in packets] == [ACTION_DOWN, ACTION_UP] * 3,
+              f"{len(packets)} packets")
+
+
+# --------------------------------------------------------------------------- #
+# 5. a board that never settles must never be tapped
+# --------------------------------------------------------------------------- #
+class _JitteringDevice:
+    def __init__(self, image: np.ndarray):
+        self.image = image
+        self.count = 0
+        self.taps: List[Tuple[int, int]] = []
+
+    def screencap(self) -> np.ndarray:
+        self.count += 1
+        return np.roll(self.image, (self.count * 7) % 60, axis=1)
+
+    def tap(self, x: int, y: int) -> None:
+        self.taps.append((x, y))
+
+
+def test_unstable_view(rep: Reporter) -> None:
+    cfg = _fast_config(1)
+    cfg.settle_timeout_ms = 400
+    game = SimGame(cfg, cols=9, rows=10, seed=9)
+    device = _JitteringDevice(game.screencap())
+    agent = ArrowAgent(cfg, device, logger=_quiet_logger())
+
+    rep.check("a moving view is refused", agent.read_stable() is None)
+    rep.check("a moving view is never tapped", agent.play_level() == "unstable")
+    rep.check("no tap was sent while moving", device.taps == [], str(device.taps[:4]))
 
 
 # --------------------------------------------------------------------------- #
@@ -327,8 +353,14 @@ def run(levels: int = 3, verbose: bool = True) -> bool:
     test_vision(rep)
     print("agent (simulated phone)")
     test_agent(rep, levels=levels)
-    print("agent with changing grid sizes")
-    test_grid_changes(rep)
+    print("zoom-out at level start")
+    test_zoom_out(rep)
+    print("agent with changing board sizes")
+    test_board_changes(rep)
+    print("scrcpy control protocol")
+    test_scrcpy_packets(rep)
+    print("a board that keeps moving")
+    test_unstable_view(rep)
     return rep.summary()
 
 

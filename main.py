@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Command line interface for the Arrow Puzzle auto-solver.
 
-    python main.py selftest           # verify the install, no phone needed
-    python main.py devices            # list connected Android devices
-    python main.py shot               # capture once, detect, save an overlay
-    python main.py run                # play levels until --max-levels
-    python main.py run --dry-run      # detect + plan, never tap
-    python main.py solve "U.R/..."    # solve a text board
+    python main.py selftest            # verify the install, no phone needed
+    python main.py devices             # list connected Android devices
+    python main.py shot                # capture once, detect, save an overlay
+    python main.py shot --image foo.png
+    python main.py run                 # play levels (fast mode, scrcpy input)
+    python main.py run --dry-run       # detect + zoom + plan, never tap
+    python main.py run --slow          # one tap per screenshot
+    python main.py run --backend adb   # no scrcpy (no pinch, slower taps)
+
+Fast mode plans the whole board once and taps it in batches over the scrcpy
+control socket: one level typically takes a few seconds after the page loads.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from arrowbot import __version__, selftest, solver
 from arrowbot.adb import Adb, AdbError
 from arrowbot.agent import ArrowAgent
 from arrowbot.config import Config
+from arrowbot.scrcpy import ScrcpyDevice, ScrcpyError
 from arrowbot.vision import Detector, render_overlay
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(message)s"
@@ -47,10 +53,17 @@ def setup_logging(verbose: bool, log_file: Optional[str] = None) -> logging.Logg
 
 def load_config(args: argparse.Namespace) -> Config:
     config = Config.load(getattr(args, "config", None))
-    for attribute in ("serial", "max_levels", "start_level"):
+    for attribute in ("serial", "max_levels", "start_level", "batch_size"):
         value = getattr(args, attribute, None)
         if value is not None:
             setattr(config, attribute, value)
+    fast = getattr(args, "fast_mode", None)
+    if fast is not None:
+        config.fast_mode = bool(fast)
+    if getattr(args, "backend", None):
+        config.input_backend = args.backend
+    if getattr(args, "no_zoom", False):
+        config.auto_zoom = False
     return config.validate()
 
 
@@ -78,11 +91,30 @@ def resolve_device(config: Config, logger: logging.Logger) -> None:
     logger.info("using device %s", config.serial)
 
 
-def save_overlay(image, detection, path: str, safe=None, min_conf: float = 0.6) -> str:
+def open_device(config: Config, logger: logging.Logger):
+    """Return ``(device, closer)``; prefers scrcpy for fast multi-touch input."""
+    adb = Adb(config.adb_path, config.serial)
+    if config.input_backend != "scrcpy":
+        logger.info("input: adb shell (slow, single finger)")
+        return adb, (lambda: None)
+    try:
+        device = ScrcpyDevice.open(adb, config)
+    except (ScrcpyError, AdbError, OSError) as exc:
+        logger.warning("scrcpy is unavailable (%s) - falling back to adb taps", exc)
+        return adb, (lambda: None)
+    logger.info("input: scrcpy on %s (%dx%d, real multi-touch)",
+                device.control.device_name or "device",
+                device.screen_width, device.screen_height)
+    return device, device.close
+
+
+def save_overlay(image, detection, path: str) -> str:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    overlay = render_overlay(image, detection, safe_cells=safe, min_confidence=min_conf)
+    safe = solver.safe_arrows(detection.arrows)
+    overlay = render_overlay(image, detection, safe=safe,
+                             title=f"{detection.describe()}")
     cv2.imwrite(path, overlay)
     return path
 
@@ -93,28 +125,24 @@ def print_detection(detection, verbose: bool = True) -> None:
         print(
             "\nNo arrows found. Things to try:\n"
             "  * open a level so the board is visible\n"
-            "  * widen 'roi' in config.json (default ignores the top 10% and bottom 10%)\n"
-            "  * add the ad banner / HUD to 'exclude_rects'\n"
+            "  * widen 'roi' in config.json\n"
+            "  * zoom the game board out (two fingers)\n"
             "  * run with -v and look at the saved overlay image"
         )
         return
-    print()
-    print(detection.to_ascii())
+    safe = solver.safe_arrows(detection.arrows)
+    print(f"safe right now: {len(safe)}")
     if not verbose:
         return
-    print()
-    for arrow in sorted(detection.arrows, key=lambda a: (a.row, a.col)):
+    for arrow in sorted(detection.arrows, key=lambda a: (a.cy, a.cx)):
         x, y = arrow.tap_point()
-        print(
-            f"  r{arrow.row:<2} c{arrow.col:<2} {arrow.direction} "
-            f"conf={arrow.confidence:.2f} tap=({x},{y})"
-        )
-    plan = solver.plan(detection.cells)
+        print(f"  {arrow.direction} -> tap=({x},{y}) conf={arrow.confidence:.2f}")
     print()
-    if plan is None:
-        print("solver: DEAD-LOCKED (or a glyph was misread) - see the overlay")
+    waves = solver.plan(detection.arrows)
+    if waves is None:
+        print("plan: DEAD-LOCKED (or an arrow was misread) - see the overlay")
     else:
-        print(f"solver: {len(plan)} wave(s), {sum(len(w) for w in plan)} tap(s)")
+        print(f"plan: {len(waves)} wave(s), {sum(len(w) for w in waves)} tap(s)")
 
 
 # --------------------------------------------------------------------------- #
@@ -152,14 +180,14 @@ def cmd_shot(args, config, logger) -> int:
     print(f"source: {source} ({width}x{height})")
     print_detection(detection, verbose=not args.quiet)
 
-    path = save_overlay(image, detection, args.out, min_conf=config.min_orientation_confidence)
+    path = save_overlay(image, detection, args.out)
     print(f"\noverlay written to {path}")
     return 0 if detection.arrows else 1
 
 
 def cmd_run(args, config, logger) -> int:
     resolve_device(config, logger)
-    device = Adb(config.adb_path, config.serial)
+    device, close = open_device(config, logger)
     agent = ArrowAgent(config, device, logger=logger)
 
     if config.write_debug:
@@ -174,40 +202,10 @@ def cmd_run(args, config, logger) -> int:
     except KeyboardInterrupt:
         logger.warning("stopped by user")
         return 130
+    finally:
+        close()
 
     logger.info("finished: %s", stats.summary())
-    return 0
-
-
-def cmd_solve(args, config, logger) -> int:
-    board_text = args.board
-    if os.path.exists(board_text):
-        try:
-            with open(board_text, "r", encoding="utf-8") as handle:
-                board_text = handle.read()
-        except (OSError, UnicodeDecodeError) as exc:
-            print(f"error: could not read {board_text} as text ({exc})")
-            return 2
-    board = solver.parse_ascii(board_text.replace("/", "\n"))
-    if not board:
-        print("error: no arrows in that board (use U D L R, '.' for empty)")
-        return 2
-
-    print(solver.format_ascii(board))
-    print()
-    for cell in solver.safe_cells(board):
-        print(f"  safe now: r{cell[0]}c{cell[1]} ({board[cell]})")
-
-    plan = solver.plan(board)
-    print()
-    if plan is None:
-        print("DEAD-LOCKED: no tap order can clear this board")
-        return 1
-    print(f"{len(plan)} wave(s):")
-    for index, wave in enumerate(plan, 1):
-        cells = " ".join(f"r{r}c{c}{board[(r, c)]}" for r, c in wave)
-        print(f"  {index:>3}. {cells}")
-    print(f"\n{sum(len(w) for w in plan)} taps total")
     return 0
 
 
@@ -236,19 +234,26 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-levels", type=int, help="stop after this many cleared levels")
     run.add_argument("--start-level", type=int, help="label for the first level (logging only)")
     run.add_argument("--serial", help="adb device serial")
-    run.add_argument("--dry-run", action="store_true", help="detect and plan, never tap")
+    run.add_argument("--batch-size", type=int, help="arrows tapped per screenshot")
+    run.add_argument("--backend", choices=("scrcpy", "adb"),
+                     help="input backend (default: scrcpy, adb fallback)")
+    run.add_argument("--no-zoom", action="store_true",
+                     help="skip the zoom-out pinch at level start")
+    mode = run.add_mutually_exclusive_group()
+    mode.add_argument("--fast", dest="fast_mode", action="store_true", default=None,
+                      help="plan once, tap batches (default)")
+    mode.add_argument("--slow", dest="fast_mode", action="store_false",
+                      help="one tap per screenshot (for a moving camera)")
+    run.add_argument("--dry-run", action="store_true",
+                     help="detect, zoom and plan, but never tap")
     run.set_defaults(func=cmd_run)
 
     shot = sub.add_parser("shot", help="capture one frame, detect, save an overlay")
     shot.add_argument("--serial", help="adb device serial")
     shot.add_argument("--image", help="analyse a saved PNG instead of the phone")
     shot.add_argument("--out", default=os.path.join("debug", "shot.png"))
-    shot.add_argument("-q", "--quiet", action="store_true", help="board summary only")
+    shot.add_argument("-q", "--quiet", action="store_true", help="summary only")
     shot.set_defaults(func=cmd_shot)
-
-    solve = sub.add_parser("solve", help="solve a text board")
-    solve.add_argument("board", help="rows separated by '/' or newlines, e.g. 'U.R/D.L' or a file")
-    solve.set_defaults(func=cmd_solve)
 
     devices = sub.add_parser("devices", help="list adb devices")
     devices.set_defaults(func=cmd_devices)

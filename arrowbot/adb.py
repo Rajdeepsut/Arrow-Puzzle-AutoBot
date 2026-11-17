@@ -132,6 +132,25 @@ class Adb:
     def tap(self, x: int, y: int) -> None:
         self._run(["shell", "input", "tap", str(int(x)), str(int(y))])
 
+    def tap_many(self, points: Sequence[Tuple[float, float]], gap_ms: int = 0,
+                 hold_ms: int = 0) -> int:
+        """Fallback batch tap: one adb shell call for all the points.
+
+        ``input`` can only tap one point per process, so this spawns a short
+        shell script instead of an adb process per tap.  ``hold_ms`` is ignored
+        because plain ``input tap`` has no press duration; the scrcpy backend is
+        the fast, multi-touch capable path.
+        """
+        commands = []
+        for index, (x, y) in enumerate(points):
+            if index and gap_ms > 0:
+                commands.append(f"sleep {gap_ms / 1000.0:.3f}")
+            commands.append(f"input tap {int(round(x))} {int(round(y))}")
+        if not commands:
+            return 0
+        self._run(["shell", "; ".join(commands)])
+        return len(points)
+
     def swipe(self, x0: int, y0: int, x1: int, y1: int, duration_ms: int = 200) -> None:
         self._run(
             [

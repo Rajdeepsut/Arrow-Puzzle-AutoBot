@@ -42,6 +42,5 @@ jobs:
       - name: CLI smoke test
         run: |
           python main.py --version
-          python main.py solve "R U . / D L U / . . R"
-          python main.py shot --image samples/sample_board.png
+          python main.py shot --image samples/sample_board.png --out debug/ci_shot.png
           python main.py devices || true   # no adb on the runner; must fail cleanly

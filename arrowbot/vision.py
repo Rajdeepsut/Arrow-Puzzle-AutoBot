@@ -1,609 +1,447 @@
-"""Screen analysis: locate the arrow grid and classify every arrow's direction.
+"""Reading an Arrow Puzzle board out of a phone screenshot.
 
-The detector is asset-free.  It does not need to know the level, the grid size
-or where the board sits on screen:
+The game draws every arrow as one solid, bent, axis-aligned stroke with a thick
+triangular head at one end.  That gives a very direct way to read a board:
 
-1. Build a few candidate binary masks of the screen (dark-on-light,
-   light-on-dark, saturation based) inside the configured region of interest.
-2. Keep blobs whose size is plausible for a game glyph, then collapse leftovers
-   with a median-area filter.
-3. Fit a *square lattice* to the blob centres.  This recovers the grid and,
-   just as importantly, discards everything that is not part of it: the level
-   number, the lives counter, buttons, ad banners.
-4. Classify each remaining blob with three independent geometric votes:
-   farthest-point, mass skewness and end-width asymmetry.
+1. **ink** - arrows are navy (``grey < 110``) or red; everything else is ignored,
+2. **heads** - the head is the only thick ink on the board, so it is a maximum of
+   the distance transform (dt ~ 5.0 on a full board vs ~2.2 on a shaft),
+3. **one arrow per head** - touching arrows share one connected blob, so blobs
+   are split between their heads (geodesic Voronoi),
+4. **direction** - the 27x27 patch around a head is matched against a synthetic
+   triangle template and its three rotations,
+5. **scale** - the camera zooms as a board empties (dt 5.0 -> 8.0).  Since the
+   head is the thickest ink, ``dt.max() / 5.0`` is the artwork scale, and the
+   template, the thickness threshold and the corridor all scale with it.
 
-Everything is expressed in original screenshot pixels, so it is resolution
-independent.
+No grid, no calibration image, no fixed cell size.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from .config import Config
-from .solver import DELTAS, DIRECTIONS, format_ascii
+DIRECTIONS = ("U", "R", "D", "L")
+VECTORS: Dict[str, Tuple[int, int]] = {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)}
 
-Cell = Tuple[int, int]
+#: dt at the centre of a real arrow head, on the reference artwork (scale 1.0)
+HEAD_DT = 5.0
+#: head geometry, measured on real screenshots: apex 8 px in front of the head
+#: centre, 11 px tall, 15 px wide at the base, with a 3 px shaft stub behind it
+HEAD_APEX_OFFSET = 8.0
+HEAD_HEIGHT = 11.0
+HEAD_BASE = 15.0
+SHAFT_HALF_WIDTH = 1.5
+SHAFT_STUB = 10.0
+#: half-size of the 27x27 patch a head is matched in
+PATCH_RADIUS = 13.0
 
-#: angle (degrees, screen coordinates: x right, y down) of each direction
-DIR_ANGLE: Dict[str, float] = {"R": 0.0, "D": 90.0, "L": 180.0, "U": 270.0}
-
-
-# --------------------------------------------------------------------------- #
-# data model
-# --------------------------------------------------------------------------- #
-@dataclass
-class Arrow:
-    row: int
-    col: int
-    direction: str
-    confidence: float
-    cx: float
-    cy: float
-    area: int
-    bbox: Tuple[int, int, int, int]
-
-    @property
-    def cell(self) -> Cell:
-        return (self.row, self.col)
-
-    @property
-    def known(self) -> bool:
-        return self.direction in DELTAS
-
-    def tap_point(self) -> Tuple[int, int]:
-        return (int(round(self.cx)), int(round(self.cy)))
-
-    def __str__(self) -> str:
-        return f"r{self.row}c{self.col}:{self.direction}({self.confidence:.2f})"
-
-
-@dataclass
-class Detection:
-    arrows: List[Arrow] = field(default_factory=list)
-    mask_kind: str = "none"
-    spacing: float = 0.0
-    origin: Tuple[float, float] = (0.0, 0.0)
-    dropped: int = 0
-    candidates: int = 0
-
-    def __len__(self) -> int:
-        return len(self.arrows)
-
-    def __bool__(self) -> bool:
-        return bool(self.arrows)
-
-    @property
-    def cells(self) -> Dict[Cell, str]:
-        return {a.cell: a.direction for a in self.arrows}
-
-    def tappable(self, min_confidence: float) -> List[Arrow]:
-        return [
-            a for a in self.arrows
-            if a.known and a.confidence >= min_confidence
-        ]
-
-    def to_ascii(self) -> str:
-        return format_ascii(self.cells)
-
-    def describe(self) -> str:
-        return (
-            f"{len(self.arrows)} arrows | mask={self.mask_kind} "
-            f"spacing={self.spacing:.1f}px origin=({self.origin[0]:.1f},"
-            f"{self.origin[1]:.1f}) candidates={self.candidates} "
-            f"dropped={self.dropped}"
-        )
+Box = Tuple[int, int, int, int]
 
 
 # --------------------------------------------------------------------------- #
-# lattice maths (module level: easy to test / reuse)
+# ink
 # --------------------------------------------------------------------------- #
-def fit_axis(values: Sequence[float], spacing: float) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Fit one axis of the lattice.
-
-    Returns ``(phase, indices, residuals)`` where ``phase + index * spacing``
-    approximates every value.  The phase is the circular mean of ``v % spacing``
-    so a handful of outliers cannot drag the whole grid around.
-    """
-    v = np.asarray(values, dtype=np.float64)
-    if v.size == 0 or spacing <= 0:
-        empty = np.zeros(0, dtype=int)
-        return 0.0, empty, np.zeros(0)
-    angles = np.mod(v, spacing) / spacing * 2.0 * np.pi
-    mean = np.mean(np.exp(1j * angles))
-    if abs(mean) < 1e-12:
-        phase = 0.0
-    else:
-        phase = float((np.angle(mean) % (2.0 * np.pi)) / (2.0 * np.pi) * spacing)
-    indices, residuals = assign_axis(v, spacing, phase)
-    return phase, indices, residuals
-
-
-def assign_axis(
-    values: Sequence[float], spacing: float, phase: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Snap values to a lattice with a *known* phase (no re-estimation).
-
-    Used for the "few arrows left" case, where one or two blobs are far too
-    little data to rediscover the grid but plenty to place on the grid we
-    already measured.
-    """
-    v = np.asarray(values, dtype=np.float64)
-    if v.size == 0 or spacing <= 0:
-        return np.zeros(0, dtype=int), np.zeros(0)
-    signed = np.mod(v - phase + spacing / 2.0, spacing) - spacing / 2.0
-    return np.rint((v - phase) / spacing).astype(int), np.abs(signed)
-
-
-def estimate_spacing(
-    xs: Sequence[float],
-    ys: Sequence[float],
-    min_spacing: float = 10.0,
-    tol_frac: float = 0.18,
-) -> Optional[Tuple[float, float, float]]:
-    """Guess the (square) cell size and lattice origin.
-
-    Candidate spacings are derived from the distances between neighbouring blob
-    centres, then scored by how many blobs they explain.  Among the candidates
-    that explain the same points we prefer the *largest* one so that halves and
-    thirds of the real cell size (which always fit too) lose the tie.
-    """
-    xs = np.asarray(xs, dtype=np.float64)
-    ys = np.asarray(ys, dtype=np.float64)
-    if xs.size < 4:
-        return None
-
-    candidates: Set[float] = set()
-    for axis in (xs, ys):
-        unique = np.unique(np.round(np.sort(axis), 1))
-        if unique.size < 2:
-            continue
-        for diff in np.diff(unique):
-            diff = float(diff)
-            if diff < min_spacing:
-                continue
-            for divisor in (1.0, 2.0, 3.0):
-                candidates.add(round(diff / divisor, 2))
-
-    results: List[Tuple[int, float, float, float, float]] = []
-    for spacing in sorted(candidates):
-        if spacing < min_spacing:
-            continue
-        ox, _, dx = fit_axis(xs, spacing)
-        oy, _, dy = fit_axis(ys, spacing)
-        tol = max(3.5, tol_frac * spacing)
-        inliers = (dx <= tol) & (dy <= tol)
-        count = int(inliers.sum())
-        if count < 4:
-            continue
-        residual = float(np.mean(np.concatenate([dx[inliers], dy[inliers]])))
-        results.append((count, float(spacing), residual, float(ox), float(oy)))
-
-    if not results:
-        return None
-
-    best_count = max(r[0] for r in results)
-    near = [r for r in results if r[0] >= best_count - 1]
-    best_residual = min(r[2] for r in near)
-    good = [r for r in near if r[2] <= best_residual * 2.0 + 1.0]
-    good.sort(key=lambda r: (r[1], -r[0]))
-    _, spacing, _, ox, oy = good[-1]
-    return spacing, ox, oy
-
-
-def angle_to_direction(angle: float) -> Tuple[str, float]:
-    """Snap an angle in degrees to the nearest cardinal direction."""
-    best, best_err = "R", 361.0
-    for direction, target in DIR_ANGLE.items():
-        err = abs((angle - target + 180.0) % 360.0 - 180.0)
-        if err < best_err:
-            best, best_err = direction, err
-    return best, best_err
-
-
-def orientation_votes(filled: np.ndarray) -> List[Tuple[np.ndarray, float]]:
-    """Three independent guesses about where an arrow points.
-
-    Each vote is ``(unit-ish vector, weight)``.  The three methods fail in
-    different ways, so agreement is a meaningful confidence signal.
-
-    a) farthest point from the centroid - the tip of a real arrow glyph
-    b) third moment along the principal axis - mass piles up at the *tail*
-    c) end width - the tip end of an arrow is narrower than the flat tail end
-    """
-    rows, cols = np.nonzero(filled)
-    if rows.size < 16:
-        return []
-    points = np.stack([cols, rows], axis=1).astype(np.float64)
-    centre = points.mean(axis=0)
-    rel = points - centre
-    try:
-        values, vectors = np.linalg.eigh(np.cov(rel.T))
-    except np.linalg.LinAlgError:  # pragma: no cover - degenerate blob
-        return []
-    axis = vectors[:, int(np.argmax(values))]
-    normal = np.array([-axis[1], axis[0]])
-
-    t = rel @ axis
-    q = rel @ normal
-
-    votes: List[Tuple[np.ndarray, float]] = []
-
-    # (a) farthest point
-    dist = np.linalg.norm(rel, axis=1)
-    votes.append((rel[int(np.argmax(dist))], 1.0))
-
-    # (b) skewness: a heavier tail means the tip points the other way
-    skew = float(np.mean(t ** 3))
-    if abs(skew) > 1e-9:
-        votes.append((math.copysign(1.0, -skew) * axis, 0.8))
-
-    # (c) end width: compare the width of the two extreme slices
-    lo, hi = float(t.min()), float(t.max())
-    span = hi - lo
-    if span > 4.0:
-        band = max(1.5, 0.06 * span)
-        width_hi = float(np.mean(np.abs(q[t >= hi - band])))
-        width_lo = float(np.mean(np.abs(q[t <= lo + band])))
-        if abs(width_hi - width_lo) > 1e-6:
-            votes.append((math.copysign(1.0, width_lo - width_hi) * axis, 1.2))
-    return votes
-
-
-def classify_orientation(filled: np.ndarray) -> Tuple[Optional[str], float]:
-    """Turn the vote list into ``(direction, confidence in 0..1)``."""
-    votes = orientation_votes(filled)
-    if not votes:
-        return None, 0.0
-
-    scores = {d: 0.0 for d in DIRECTIONS}
-    total = 0.0
-    for vector, weight in votes:
-        vector = np.asarray(vector, dtype=np.float64).ravel()
-        norm = float(math.hypot(vector[0], vector[1]))
-        if norm < 1e-9:
-            continue
-        vector = vector / norm
-        angle = math.degrees(math.atan2(vector[1], vector[0])) % 360.0
-        direction, err = angle_to_direction(angle)
-        total += weight
-        if err <= 35.0:
-            scores[direction] += weight * (1.0 - err / 90.0)
-
-    if total <= 0.0:
-        return None, 0.0
-    best = max(DIRECTIONS, key=lambda d: scores[d])
-    if scores[best] <= 1e-9:
-        return None, 0.0
-    return best, float(min(1.0, scores[best] / total))
-
-
-# --------------------------------------------------------------------------- #
-# detector
-# --------------------------------------------------------------------------- #
-class Detector:
-    """Converts a screenshot into a :class:`Detection`.
-
-    The detector remembers the last lattice it fitted.  That matters at the end
-    of a level: with only one or two arrows left there is no way to rediscover
-    the grid from scratch, but there is no need to either - the board has not
-    moved since the last frame.
-    """
-
-    def __init__(self, config: Config):
-        self.config = config
-        self._lattice: Optional[Tuple[float, float, float]] = None  # spacing, ox, oy
-
-    def reset_lattice(self) -> None:
-        """Forget the remembered grid (e.g. after a rotation or resize)."""
-        self._lattice = None
-
-    # -- public ------------------------------------------------------------
-    def detect(self, image: np.ndarray) -> Detection:
-        if image is None or image.size == 0:
-            return Detection()
-        if image.ndim == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-        best: Optional[Detection] = None
-        best_key: Optional[Tuple[int, float]] = None
-
-        for kind, mask in self._masks(image):
-            blobs, labels = self._blobs(mask)
-            if not blobs:
-                continue
-
-            # Prefer the grid we measured on an earlier frame: it keeps row and
-            # column numbers stable and cannot suddenly pick half a cell size.
-            fit = self._fit_remembered(blobs) if self._lattice is not None else None
-            if fit is not None and len(fit[0]) < 0.6 * len(blobs):
-                fit = None  # the grid moved or the board size changed
-            if fit is None and len(blobs) >= 4:
-                fit = self._fit(blobs)
-            if fit is None:
-                continue
-
-            fitted, spacing, origin, dropped = fit
-            if not fitted:
-                continue
-
-            arrows: List[Arrow] = []
-            for blob, (row, col) in fitted:
-                direction, confidence = self._classify(labels, blob)
-                if direction is None:
-                    direction, confidence = "?", 0.0
-                arrows.append(
-                    Arrow(
-                        row=row,
-                        col=col,
-                        direction=direction,
-                        confidence=confidence,
-                        cx=float(blob["cx"]),
-                        cy=float(blob["cy"]),
-                        area=int(blob["area"]),
-                        bbox=blob["bbox"],
-                    )
-                )
-            if not arrows:
-                continue
-
-            confidences = [a.confidence for a in arrows if a.known]
-            mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
-            key = (len(arrows), round(mean_conf, 3))
-            if best_key is None or key > best_key:
-                best_key = key
-                best = Detection(
-                    arrows=arrows,
-                    mask_kind=kind,
-                    spacing=spacing,
-                    origin=origin,
-                    dropped=dropped,
-                    candidates=len(blobs),
-                )
-        if best is not None and best.spacing > 0:
-            # keep the grid of the winning mask for the next frame
-            self._lattice = (best.spacing, best.origin[0], best.origin[1])
-        return best or Detection()
-
-    # -- masks -------------------------------------------------------------
-    def _roi_mask(self, height: int, width: int) -> np.ndarray:
-        mask = np.zeros((height, width), np.uint8)
-        x0, y0, x1, y1 = self._rect_px(self.config.roi, height, width)
-        mask[y0:y1, x0:x1] = 255
-        for rect in self.config.exclude_rects:
-            rx0, ry0, rx1, ry1 = self._rect_px(rect, height, width)
-            mask[ry0:ry1, rx0:rx1] = 0
-        # never trust a one pixel border: PNG edge artefacts live there
-        mask[0:2, :] = 0
-        mask[-2:, :] = 0
-        mask[:, 0:2] = 0
-        mask[:, -2:] = 0
-        return mask
-
-    @staticmethod
-    def _rect_px(rect: Sequence[float], height: int, width: int) -> Tuple[int, int, int, int]:
-        x0, y0, x1, y1 = (float(v) for v in rect)
-        return (
-            max(0, int(round(x0 * width))),
-            max(0, int(round(y0 * height))),
-            min(width, int(round(x1 * width))),
-            min(height, int(round(y1 * height))),
-        )
-
-    def _masks(self, image: np.ndarray) -> Iterable[Tuple[str, np.ndarray]]:
-        height, width = image.shape[:2]
-        roi = self._roi_mask(height, width)
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, dark_on_light = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
-        )
-        _, light_on_dark = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-        )
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        _, saturated = cv2.threshold(
-            hsv[:, :, 1], 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-        )
-
-        kernel = None
-        if self.config.morph_close >= 3:
-            size = int(self.config.morph_close)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-
-        for kind, raw in (
-            ("dark-on-light", dark_on_light),
-            ("light-on-dark", light_on_dark),
-            ("saturated", saturated),
-        ):
-            mask = cv2.bitwise_and(raw, roi)
-            if kernel is not None:
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            yield kind, mask
-
-    # -- blobs -------------------------------------------------------------
-    def _blobs(self, mask: np.ndarray) -> Tuple[List[dict], np.ndarray]:
-        height, width = mask.shape
-        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            mask, 8, cv2.CV_32S
-        )
-        screen_area = float(height * width)
-        area_min = max(24.0, self.config.min_blob_area_frac * screen_area)
-        area_max = max(area_min * 4.0, self.config.max_blob_area_frac * screen_area)
-
-        blobs: List[dict] = []
-        for label in range(1, count):
-            x, y, bw, bh, area = (int(v) for v in stats[label])
-            if area < area_min or area > area_max:
-                continue
-            if bw < 5 or bh < 5:
-                continue
-            aspect = bw / float(bh)
-            if aspect < 0.33 or aspect > 3.0:
-                continue
-            blobs.append(
-                {
-                    "label": label,
-                    "cx": float(centroids[label][0]),
-                    "cy": float(centroids[label][1]),
-                    "area": area,
-                    "bbox": (x, y, bw, bh),
-                }
-            )
-        if len(blobs) < 2:
-            return blobs, labels
-
-        # a glyph of a different size (a digit, a button icon) is probably not
-        # part of the grid - keep everything within a generous band of the median
-        median = float(np.median([b["area"] for b in blobs]))
-        blobs = [b for b in blobs if 0.25 * median <= b["area"] <= 4.0 * median]
-        return blobs, labels
-
-    # -- lattice -----------------------------------------------------------
-    def _fit(
-        self, blobs: Sequence[dict]
-    ) -> Optional[Tuple[List[Tuple[dict, Cell]], float, Tuple[float, float], int]]:
-        """Discover the grid from scratch (needs a decent number of blobs)."""
-        xs = np.array([b["cx"] for b in blobs], dtype=np.float64)
-        ys = np.array([b["cy"] for b in blobs], dtype=np.float64)
-        estimate = estimate_spacing(xs, ys)
-        if estimate is None:
-            return None
-        spacing, ox, oy = estimate
-        fitted, dropped = self._assign(blobs, spacing, ox, oy)
-        if len(fitted) < 4:
-            return None
-        return fitted, float(spacing), (float(ox), float(oy)), dropped
-
-    def _fit_remembered(
-        self, blobs: Sequence[dict]
-    ) -> Optional[Tuple[List[Tuple[dict, Cell]], float, Tuple[float, float], int]]:
-        """Place blobs on the grid measured on an earlier frame."""
-        if self._lattice is None:
-            return None
-        spacing, ox, oy = self._lattice
-        fitted, dropped = self._assign(blobs, spacing, ox, oy)
-        if not fitted:
-            return None
-        return fitted, float(spacing), (float(ox), float(oy)), dropped
-
-    def _assign(
-        self, blobs: Sequence[dict], spacing: float, ox: float, oy: float
-    ) -> Tuple[List[Tuple[dict, Cell]], int]:
-        tol = max(4.0, self.config.spacing_tolerance * spacing)
-        xs = np.array([b["cx"] for b in blobs], dtype=np.float64)
-        ys = np.array([b["cy"] for b in blobs], dtype=np.float64)
-        ix, dx = assign_axis(xs, spacing, ox)
-        iy, dy = assign_axis(ys, spacing, oy)
-
-        kept: Dict[Cell, int] = {}
-        dropped = 0
-        for index in range(len(blobs)):
-            if dx[index] > tol or dy[index] > tol:
-                dropped += 1
-                continue
-            cell = (int(iy[index]), int(ix[index]))
-            previous = kept.get(cell)
-            if previous is None:
-                kept[cell] = index
-            elif blobs[index]["area"] > blobs[previous]["area"]:
-                kept[cell] = index
-                dropped += 1
-            else:
-                dropped += 1
-
-        fitted = [(blobs[index], cell) for cell, index in kept.items()]
-        fitted.sort(key=lambda item: item[1])
-        return fitted, dropped
-
-    # -- glyph -------------------------------------------------------------
-    def _classify(self, labels: np.ndarray, blob: dict) -> Tuple[Optional[str], float]:
-        x, y, bw, bh = blob["bbox"]
-        pad = 2
-        height, width = labels.shape
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(width, x + bw + pad), min(height, y + bh + pad)
-
-        patch = (labels[y0:y1, x0:x1] == blob["label"]).astype(np.uint8)
-        if int(patch.sum()) < 16:
-            return None, 0.0
-        patch = cv2.morphologyEx(patch * 255, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-
-        contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None, 0.0
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 12:
-            return None, 0.0
-
-        filled = np.zeros_like(patch)
-        cv2.drawContours(filled, [contour], -1, 255, thickness=cv2.FILLED)
-        return classify_orientation(filled)
-
-
-# --------------------------------------------------------------------------- #
-# debug rendering
-# --------------------------------------------------------------------------- #
-def render_overlay(
+def ink_mask(
     image: np.ndarray,
-    detection: Detection,
-    safe_cells: Optional[Set[Cell]] = None,
-    min_confidence: float = 0.6,
-    title: Optional[str] = None,
+    roi: Optional[Sequence[float]] = None,
+    exclude_rects: Optional[Sequence[Sequence[float]]] = None,
+    gray_max: int = 110,
+    red: bool = True,
 ) -> np.ndarray:
-    """Annotated copy of the screenshot (written to the debug directory)."""
-    out = image.copy()
-    if out.ndim == 2:
-        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
-    safe = safe_cells or set()
+    """Binary mask of arrow ink, restricted to ``roi`` (screen fractions).
 
-    for arrow in detection.arrows:
-        x, y = int(round(arrow.cx)), int(round(arrow.cy))
-        if arrow.cell in safe:
-            colour = (0, 170, 0)
-        elif not arrow.known or arrow.confidence < min_confidence:
-            colour = (0, 165, 255)
-        else:
-            colour = (0, 0, 220)
-        cv2.circle(out, (x, y), 7, colour, 2, cv2.LINE_AA)
-        cv2.putText(
-            out,
-            f"{arrow.direction}{arrow.confidence * 9:.0f}",
-            (x + 9, y - 9),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            colour,
-            1,
-            cv2.LINE_AA,
+    Navy is any sufficiently dark pixel; red arrows are found by their colour
+    signature.  Both kinds are ordinary arrows and are treated identically.
+    """
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    blue, green, red_channel = cv2.split(image.astype(np.int16))
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mask = grey < gray_max
+    if red:
+        mask |= (
+            (red_channel > 130)
+            & (green < 130)
+            & (blue < 130)
+            & (red_channel - green > 40)
+            & (red_channel - blue > 40)
         )
 
-    header = title or detection.describe()
-    cv2.rectangle(out, (0, 0), (out.shape[1], 26), (0, 0, 0), -1)
-    cv2.putText(
-        out, header, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA
+    height, width = mask.shape
+    x0, y0, x1, y1 = fractions_to_box(roi, width, height)
+    keep = np.zeros_like(mask)
+    keep[y0:y1, x0:x1] = True
+    for rect in exclude_rects or ():
+        rx0, ry0, rx1, ry1 = fractions_to_box(rect, width, height)
+        keep[ry0:ry1, rx0:rx1] = False
+    return (mask & keep).astype(np.uint8)
+
+
+def fractions_to_box(
+    fractions: Optional[Sequence[float]], width: int, height: int
+) -> Box:
+    """``(x0, y0, x1, y1)`` in pixels from screen fractions (default: everything)."""
+    if not fractions or len(fractions) != 4:
+        return 0, 0, width, height
+    x0, y0, x1, y1 = fractions
+    return (
+        int(round(x0 * width)),
+        int(round(y0 * height)),
+        int(round(x1 * width)),
+        int(round(y1 * height)),
     )
 
-    if detection.spacing > 0 and detection.arrows:
-        step = detection.spacing
-        origin_x, origin_y = detection.origin
-        rmax = max(a.row for a in detection.arrows) + 1
-        cmax = max(a.col for a in detection.arrows) + 1
-        rmin = min(a.row for a in detection.arrows)
-        cmin = min(a.col for a in detection.arrows)
-        # draw cell borders (half a cell away from the arrow centres)
-        for row in range(rmin, rmax + 1):
-            y = int(round(origin_y + (row - 0.5) * step))
-            if 0 <= y < out.shape[0]:
-                cv2.line(out, (0, y), (out.shape[1], y), (200, 200, 200), 1)
-        for col in range(cmin, cmax + 1):
-            x = int(round(origin_x + (col - 0.5) * step))
-            if 0 <= x < out.shape[1]:
-                cv2.line(out, (x, 0), (x, out.shape[0]), (200, 200, 200), 1)
-    return out
+
+def bbox_of(mask: np.ndarray) -> Box:
+    rows, columns = np.nonzero(mask)
+    if len(columns) == 0:
+        return 0, 0, 0, 0
+    return (int(columns.min()), int(rows.min()), int(columns.max()), int(rows.max()))
+
+
+# --------------------------------------------------------------------------- #
+# scale
+# --------------------------------------------------------------------------- #
+def estimate_scale(mask: np.ndarray, dt: Optional[np.ndarray] = None,
+                   limits: Sequence[float] = (0.5, 4.0)) -> float:
+    """Artwork scale: the head is the thickest ink, so ``dt.max() / 5``.
+
+    The game zooms the camera in as a board empties, which grows every part of
+    the drawing; this one number tells the rest of the pipeline how big things
+    are *right now*.
+    """
+    if dt is None:
+        dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if not dt.any():
+        return 1.0
+    scale = float(dt.max()) / HEAD_DT
+    low, high = float(limits[0]), float(limits[1])
+    return min(max(scale, low), high)
+
+
+# --------------------------------------------------------------------------- #
+# heads
+# --------------------------------------------------------------------------- #
+def component_pixels(labels: np.ndarray, stats: np.ndarray, label: int
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """Pixels of one labelled component, without scanning the whole image."""
+    left, top, width, height = (int(v) for v in stats[label, :4])
+    window = labels[top:top + height, left:left + width] == label
+    rows, columns = np.nonzero(window)
+    return columns + left, rows + top
+
+
+def head_points(mask: np.ndarray, dt: Optional[np.ndarray] = None,
+                scale: float = 1.0, min_pixels: Optional[int] = None
+                ) -> List[Tuple[int, int, float]]:
+    """One point per arrow head, as ``(x, y, thickness)``."""
+    if dt is None:
+        dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    # the head is ~3.4x thicker than a shaft at every scale
+    threshold = 3.4 * scale
+    if min_pixels is None:
+        min_pixels = max(4, int(round(6 * scale * scale)))
+    blobs = (dt >= threshold).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(blobs, 8)
+    points: List[Tuple[int, int, float]] = []
+    for index in range(1, count):
+        if stats[index, cv2.CC_STAT_AREA] < min_pixels:
+            continue
+        columns, rows = component_pixels(labels, stats, index)
+        values = dt[rows, columns]
+        best = int(np.argmax(values))
+        points.append((int(columns[best]), int(rows[best]), float(values[best])))
+    return points
+
+
+def split_component(label_id: int, labels: np.ndarray, stats: np.ndarray,
+                    seeds: Sequence[Tuple[int, int, float]]
+                    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """Partition one ink blob between its heads by multi-source BFS."""
+    x0, y0, width, height = (int(v) for v in stats[label_id, :4])
+    x1, y1 = x0 + width - 1, y0 + height - 1
+
+    owner = np.full((height, width), -1, np.int32)
+    for index, (seed_x, seed_y, _) in enumerate(seeds):
+        owner[seed_y - y0, seed_x - x0] = index
+    free = (labels[y0:y1 + 1, x0:x1 + 1] == label_id) & (owner < 0)
+
+    for _ in range(max(height, width) + 4):
+        if not free.any():
+            break
+        grew = False
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            shifted = np.full_like(owner, -1)
+            y_dst, x_dst = slice(max(0, dy), height + min(0, dy)), slice(max(0, dx), width + min(0, dx))
+            y_src, x_src = slice(max(0, -dy), height + min(0, -dy)), slice(max(0, -dx), width + min(0, -dx))
+            shifted[y_dst, x_dst] = owner[y_src, x_src]
+            take = free & (shifted >= 0)
+            if take.any():
+                owner[take] = shifted[take]
+                free[take] = False
+                grew = True
+        if not grew:
+            break
+
+    parts: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    for index, (seed_x, seed_y, _) in enumerate(seeds):
+        rows_k, columns_k = np.nonzero(owner == index)
+        if len(rows_k):
+            parts[index] = (columns_k + x0, rows_k + y0)
+        else:
+            parts[index] = (np.array([seed_x]), np.array([seed_y]))
+    return parts
+
+
+# --------------------------------------------------------------------------- #
+# direction
+# --------------------------------------------------------------------------- #
+def triangle(scale: float = 1.0) -> np.ndarray:
+    """Synthetic head pointing up, with its shaft stub, at ``scale``."""
+    radius = max(4, int(round(PATCH_RADIUS * scale)))
+    size = 2 * radius + 1
+    patch = np.zeros((size, size), np.float32)
+    apex_y = radius - HEAD_APEX_OFFSET * scale
+    base_y = apex_y + HEAD_HEIGHT * scale
+    half_base = HEAD_BASE * scale / 2.0
+    points = np.array(
+        [(radius - half_base, base_y), (radius + half_base, base_y), (radius, apex_y)],
+        np.float32,
+    )
+    cv2.fillConvexPoly(patch, np.round(points).astype(np.int32), 1.0)
+
+    stub_half = max(1, int(round(SHAFT_HALF_WIDTH * scale)))
+    stub_end = min(size - 1, int(round(base_y + SHAFT_STUB * scale)))
+    if stub_end > base_y:
+        cv2.rectangle(
+            patch,
+            (radius - stub_half, int(round(base_y))),
+            (radius + stub_half, stub_end),
+            1.0,
+            -1,
+        )
+    return patch
+
+
+def rotations(up: np.ndarray) -> Dict[str, np.ndarray]:
+    return {
+        "U": up,
+        "R": cv2.rotate(up, cv2.ROTATE_90_CLOCKWISE),
+        "D": cv2.rotate(up, cv2.ROTATE_180),
+        "L": cv2.rotate(up, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    }
+
+
+def templates(scale: float = 1.0) -> Dict[str, np.ndarray]:
+    return rotations(triangle(scale))
+
+
+def own_patch(xs: np.ndarray, ys: np.ndarray, x: int, y: int, radius: int) -> np.ndarray:
+    """The part of an arrow that falls inside a patch centred on its head."""
+    size = 2 * radius + 1
+    patch = np.zeros((size, size), np.float32)
+    dx, dy = xs - x + radius, ys - y + radius
+    inside = (dx >= 0) & (dx <= 2 * radius) & (dy >= 0) & (dy <= 2 * radius)
+    patch[dy[inside], dx[inside]] = 1.0
+    return patch
+
+
+def vote(patch: np.ndarray, options: Dict[str, np.ndarray]
+         ) -> Tuple[str, Dict[str, float], float]:
+    """Best matching direction, all scores, and the margin over the runner-up.
+
+    This is ``TM_CCOEFF_NORMED`` written out by hand: the patch and the template
+    are the same size, so one dot product per direction is all it takes.  (The
+    OpenCV call has ~1.7 ms of overhead per template, which dominated the whole
+    loop on a 140-arrow board.)
+    """
+    flat = np.asarray(patch, np.float64).ravel()
+    flat = flat - flat.mean()
+    norm = float(np.sqrt(flat @ flat))
+    if norm < 1e-6:
+        return "U", {direction: 0.0 for direction in options}, 0.0
+    scores: Dict[str, float] = {}
+    for direction, template in options.items():
+        centred = np.asarray(template, np.float64).ravel()
+        centred = centred - centred.mean()
+        denominator = norm * float(np.sqrt(centred @ centred))
+        scores[direction] = float(centred @ flat) / denominator if denominator else 0.0
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    return ranked[0], scores, scores[ranked[0]] - scores[ranked[1]]
+
+
+# --------------------------------------------------------------------------- #
+# the board
+# --------------------------------------------------------------------------- #
+@dataclass(eq=False)
+class Arrow:
+    """One arrow: where its head is, where it points, and the ink it owns."""
+
+    head: Tuple[int, int]
+    direction: str
+    confidence: float
+    scale: float
+    xs: np.ndarray
+    ys: np.ndarray
+
+    @property
+    def cx(self) -> int:
+        return self.head[0]
+
+    @property
+    def cy(self) -> int:
+        return self.head[1]
+
+    @property
+    def size(self) -> int:
+        return len(self.xs)
+
+    def tap_point(self) -> Tuple[int, int]:
+        """A point that is unambiguously inside the arrow (its head)."""
+        return self.head
+
+    def __str__(self) -> str:
+        return f"{self.direction}@({self.head[0]},{self.head[1]}) conf={self.confidence:.2f}"
+
+
+@dataclass(eq=False)
+class Detection:
+    """Everything one screenshot said about the board."""
+
+    image: np.ndarray
+    mask: np.ndarray
+    scale: float
+    arrows: List[Arrow]
+    bbox: Box
+
+    @property
+    def heads(self) -> List[Tuple[int, int]]:
+        return [arrow.head for arrow in self.arrows]
+
+    def signature(self) -> Tuple[Box, Tuple[Tuple[int, int], ...]]:
+        """A cheap fingerprint used to detect that the camera stopped moving."""
+        return self.bbox, tuple(sorted(self.heads))
+
+    def same_view(self, other: "Detection", tolerance: int = 2) -> bool:
+        """True when both frames show the same, unmoved board."""
+        if other is None or len(self.arrows) != len(other.arrows):
+            return False
+        if max(abs(a - b) for a, b in zip(self.bbox, other.bbox)) > tolerance:
+            return False
+        for (x, y), (u, v) in zip(sorted(self.heads), sorted(other.heads)):
+            if abs(x - u) > tolerance or abs(y - v) > tolerance:
+                return False
+        return True
+
+    def describe(self) -> str:
+        counts = {d: 0 for d in DIRECTIONS}
+        for arrow in self.arrows:
+            counts[arrow.direction] = counts.get(arrow.direction, 0) + 1
+        spread = " ".join(f"{d}{counts[d]}" for d in DIRECTIONS)
+        low = sum(1 for arrow in self.arrows if arrow.confidence < 0.10)
+        text = (f"{len(self.arrows)} arrows | scale={self.scale:.2f} | {spread} | "
+                f"bbox={self.bbox}")
+        return text + (f" | {low} uncertain" if low else "")
+
+    def plan(self):
+        """Greedy clear plan (list of waves), or ``None`` on a deadlock."""
+        from . import solver
+
+        return solver.plan(self.arrows)
+
+
+class Detector:
+    """Turns a screenshot into :class:`Detection`."""
+
+    def __init__(self, config=None):
+        self.config = config
+
+    # ---------------------------------------------------------------- helpers
+    def _knob(self, name: str, default):
+        return getattr(self.config, name, default) if self.config is not None else default
+
+    def ink(self, image: np.ndarray) -> np.ndarray:
+        return ink_mask(
+            image,
+            roi=self._knob("roi", None),
+            exclude_rects=self._knob("exclude_rects", None),
+            gray_max=int(self._knob("ink_gray_max", 110)),
+            red=bool(self._knob("red_ink", True)),
+        )
+
+    def detect(self, image: np.ndarray) -> Detection:
+        mask = self.ink(image)
+        dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        scale = estimate_scale(mask, dt, self._knob("scale_range", (0.5, 4.0)))
+        arrows = self.arrows(mask, scale, dt)
+        return Detection(image=image, mask=mask, scale=scale,
+                         arrows=arrows, bbox=bbox_of(mask))
+
+    def arrows(self, mask: np.ndarray, scale: float,
+               dt: Optional[np.ndarray] = None) -> List[Arrow]:
+        if dt is None:
+            dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        options = templates(scale)
+        radius = options["U"].shape[0] // 2
+        min_pixels = max(30, int(round(float(self._knob("min_arrow_pixels", 60)) * scale * scale)))
+
+        points = head_points(mask, dt, scale=scale,
+                             min_pixels=self._knob("min_head_pixels", None))
+        _count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+        per_blob: Dict[int, List[Tuple[int, int, float]]] = {}
+        for point in points:
+            blob = int(labels[point[1], point[0]])
+            if blob:
+                per_blob.setdefault(blob, []).append(point)
+
+        arrows: List[Arrow] = []
+        for blob, seeds in per_blob.items():
+            if len(seeds) > 1:
+                parts = split_component(blob, labels, stats, seeds)
+            else:
+                parts = {0: component_pixels(labels, stats, blob)}
+            for index, (x, y, _thickness) in enumerate(seeds):
+                xs, ys = parts[index]
+                if len(xs) < min_pixels:
+                    continue
+                direction, _scores, margin = vote(own_patch(xs, ys, x, y, radius), options)
+                arrows.append(Arrow(head=(x, y), direction=direction,
+                                    confidence=margin, scale=scale, xs=xs, ys=ys))
+        return arrows
+
+
+# --------------------------------------------------------------------------- #
+# debug drawing
+# --------------------------------------------------------------------------- #
+_PALETTE = {
+    "safe": (60, 200, 60),
+    "blocked": (150, 150, 150),
+    "text": (30, 30, 30),
+}
+
+
+def render_overlay(image: np.ndarray, detection: Detection,
+                   safe: Optional[Sequence[Arrow]] = None,
+                   title: str = "") -> np.ndarray:
+    """Screenshot with every arrow marked: green = safe, grey = blocked."""
+    canvas = image.copy()
+    safe_ids = {id(arrow) for arrow in safe or ()}
+    for arrow in detection.arrows:
+        colour = _PALETTE["safe"] if id(arrow) in safe_ids else _PALETTE["blocked"]
+        vx, vy = VECTORS[arrow.direction]
+        length = int(round(26 * detection.scale))
+        x, y = arrow.head
+        cv2.arrowedLine(canvas, (x, y), (x + vx * length, y + vy * length),
+                        colour, max(1, int(round(detection.scale))), cv2.LINE_AA, 0, 0.35)
+        cv2.circle(canvas, (x, y), max(3, int(round(3 * detection.scale))), colour, -1)
+    if title:
+        cv2.putText(canvas, title, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 5, cv2.LINE_AA)
+        cv2.putText(canvas, title, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    _PALETTE["text"], 2, cv2.LINE_AA)
+    return canvas

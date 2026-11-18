@@ -80,11 +80,11 @@ def test_a_fitted_view_is_not_pinched():
     assert game.camera_zoom == 1.0
 
 
-@pytest.mark.parametrize("name,min_arrows,scale_at_least", [
-    ("real_level.png", 50, 1.2),          # fitted camera, the normal play state
-    ("real_level_zoomed.png", 70, 0.5),   # camera mid-adjustment, scale ~1.0
+@pytest.mark.parametrize("name,arrow_count,scale_at_least", [
+    ("real_level.png", 56, 1.2),          # fitted camera, the normal play state
+    ("real_level_zoomed.png", 78, 0.5),   # camera mid-adjustment, scale ~1.0
 ])
-def test_real_game_frames_are_readable(name, min_arrows, scale_at_least):
+def test_real_game_frames_are_readable(name, arrow_count, scale_at_least):
     """Captured from the real game: every arrow must be certain, and the board
     must have a legal clear order (a deadlock here would mean a misread)."""
     image = cv2.imread(str(SAMPLES / name))
@@ -92,7 +92,9 @@ def test_real_game_frames_are_readable(name, min_arrows, scale_at_least):
     config = Config().validate()
     detection = Detector(config).detect(image)
 
-    assert len(detection.arrows) >= min_arrows, detection.describe()
+    # the game's own remaining-arrow counter is visible in both fixtures, so
+    # this is an exact, externally verified count
+    assert len(detection.arrows) == arrow_count, detection.describe()
     assert detection.scale >= scale_at_least
     low = [arrow for arrow in detection.arrows
            if arrow.confidence < config.min_direction_margin]

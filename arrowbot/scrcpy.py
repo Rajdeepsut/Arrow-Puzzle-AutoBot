@@ -24,6 +24,7 @@ Everything here is optional: if scrcpy cannot start, the agent falls back to
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import socket
@@ -53,6 +54,8 @@ ACTION_POINTER_UP = 6
 
 #: message type
 MSG_TOUCH = 2
+
+log = logging.getLogger("arrowbot.scrcpy")
 
 
 class ScrcpyError(RuntimeError):
@@ -131,6 +134,14 @@ class ScrcpyControl:
         self.sock: Optional[socket.socket] = None
         self.server: Optional[subprocess.Popen] = None
         self.device_name = ""
+        #: a phone that slept or a USB hiccup must not end the run: the next
+        #: tap reconnects, but a growing cooldown keeps a missing phone from
+        #: being hammered with adb restarts
+        self._last_connect_attempt = 0.0
+        self._connect_cooldown = 1.0
+        #: a mid-gesture reconnect would leave stray pointers, so gestures
+        #: abort and are retried instead of rebuilding the socket underneath
+        self._auto_reconnect = True
 
     # ------------------------------------------------------------------ adb
     def _adb_command(self, args: Sequence[str]) -> list:
@@ -224,13 +235,65 @@ class ScrcpyControl:
         self.close()
         raise ScrcpyError(f"could not connect to the scrcpy control socket: {last_error}")
 
+    # ------------------------------------------------------------- reconnect
+    @property
+    def connected(self) -> bool:
+        """True while both the control socket and its server are alive."""
+        if self.sock is None:
+            return False
+        return self.server is None or self.server.poll() is None
+
+    def _drop_socket(self) -> None:
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def ensure_connected(self, force: bool = False) -> None:
+        """Reconnect a dead control channel instead of failing forever.
+
+        Android drops the ADB link when the phone sleeps, and the scrcpy server
+        can be killed by the system.  Rebuilding the server takes a couple of
+        seconds and does not touch the game, so it is safe to do between taps.
+        """
+        if self.connected:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_connect_attempt < self._connect_cooldown:
+            raise ScrcpyError("control socket is down (reconnecting)")
+        self._last_connect_attempt = now
+        log.warning("control socket lost - reconnecting to the phone")
+        try:
+            self.close()
+            self.start()
+        except Exception:
+            # the phone may still be asleep: wait longer before the next try
+            self._connect_cooldown = min(30.0, self._connect_cooldown * 2)
+            raise
+        self._connect_cooldown = 1.0
+
+    def reconnect(self) -> "ScrcpyControl":
+        """Force a fresh server + socket (used by the device test and recovery)."""
+        self.ensure_connected(force=True)
+        return self
+
     # --------------------------------------------------------------- control
     def _send(self, packet: bytes) -> None:
+        if not self.connected:
+            if not self._auto_reconnect:
+                self._drop_socket()
+                raise ScrcpyError("control socket lost during a gesture")
+            self.ensure_connected()
         if self.sock is None:
             raise ScrcpyError("control socket is not connected")
         try:
             self.sock.sendall(packet)
         except OSError as exc:
+            # the next event rebuilds the channel; keeping the broken socket
+            # would make every tap fail for the rest of the run
+            self._drop_socket()
             raise ScrcpyError(f"control socket closed: {exc}") from exc
 
     def touch(self, action: int, pointer_id: int, x: float, y: float,
@@ -290,15 +353,20 @@ class ScrcpyControl:
         kwargs = dict(screen_width=screen_width, screen_height=screen_height)
         steps = max(1, int(steps))
         delay = max(0.0, duration_ms) / 1000.0 / steps
-        self.down(x0, y0, pointer_id, **kwargs)
+        self._auto_reconnect = False
         try:
+            self.down(x0, y0, pointer_id, **kwargs)
             for step in range(1, steps + 1):
                 self.move(x0 + (x1 - x0) * step / steps,
                           y0 + (y1 - y0) * step / steps, pointer_id, **kwargs)
                 if delay:
                     time.sleep(delay)
         finally:
-            self.up(x1, y1, pointer_id, **kwargs)
+            try:
+                self.up(x1, y1, pointer_id, **kwargs)
+            except ScrcpyError:
+                self._drop_socket()
+            self._auto_reconnect = True
 
     def pinch(self, center_x: float, center_y: float,
               start_gap: float, end_gap: float,
@@ -328,6 +396,7 @@ class ScrcpyControl:
         delay = max(0.0, duration_ms) / 1000.0 / steps
         a_x, a_y = point(start_gap, -1)
         b_x, b_y = point(start_gap, +1)
+        self._auto_reconnect = False
         try:
             self.down(a_x, a_y, first, **kwargs)
             self.down(b_x, b_y, second, **kwargs)
@@ -340,8 +409,12 @@ class ScrcpyControl:
                 if delay:
                     time.sleep(delay)
         finally:
-            self.up(a_x, a_y, first, **kwargs)
-            self.up(b_x, b_y, second, **kwargs)
+            try:
+                self.up(a_x, a_y, first, **kwargs)
+                self.up(b_x, b_y, second, **kwargs)
+            except ScrcpyError:
+                self._drop_socket()
+            self._auto_reconnect = True
         if settle_ms:
             time.sleep(settle_ms / 1000.0)
 
@@ -357,12 +430,7 @@ class ScrcpyControl:
 
     # --------------------------------------------------------------- cleanup
     def close(self) -> None:
-        sock, self.sock = self.sock, None
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
+        self._drop_socket()
         if self.server is not None:
             self.server.terminate()
             try:

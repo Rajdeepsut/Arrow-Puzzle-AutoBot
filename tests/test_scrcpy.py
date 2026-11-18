@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import struct
 
+import pytest
+
 from arrowbot.adb import Adb
 from arrowbot.config import Config
-from arrowbot.scrcpy import ACTION_DOWN, ACTION_UP, MSG_TOUCH, ScrcpyControl, ScrcpyDevice
+from arrowbot.scrcpy import (
+    ACTION_DOWN,
+    ACTION_UP,
+    MSG_TOUCH,
+    ScrcpyControl,
+    ScrcpyDevice,
+    ScrcpyError,
+)
 
 
 def _packets(control: ScrcpyControl):
@@ -138,3 +147,111 @@ def test_fast_defaults_are_sane():
     assert config.batch_wait_ms < 1000
     assert config.auto_zoom is True
     assert config.zoom_start_gap_px > config.zoom_end_gap_px
+
+
+class _BrokenSocket:
+    def __init__(self):
+        self.closed = False
+
+    def sendall(self, packet):
+        raise OSError("phone went away")
+
+    def close(self):
+        self.closed = True
+
+
+class _GoodSocket:
+    def __init__(self):
+        self.sent = []
+
+    def sendall(self, packet):
+        self.sent.append(packet)
+
+    def close(self):
+        pass
+
+
+class _DeadServer:
+    @staticmethod
+    def poll():
+        return 1
+
+
+def test_a_dead_socket_is_dropped_and_the_next_tap_reconnects():
+    control = ScrcpyControl()
+    broken = _BrokenSocket()
+    control.sock = broken
+
+    with pytest.raises(ScrcpyError):
+        control._send(b"x")
+    assert control.sock is None
+    assert broken.closed
+
+    reconnects = []
+
+    def reconnect(force=False):
+        reconnects.append(force)
+        control.sock = _GoodSocket()
+
+    control.ensure_connected = reconnect       # type: ignore[method-assign]
+    control._send(b"y")
+
+    assert reconnects == [False]
+    assert control.sock.sent == [b"y"]
+
+
+def test_a_dead_server_forces_a_fresh_control_channel():
+    control = ScrcpyControl()
+    control.sock = _GoodSocket()
+    control.server = _DeadServer()             # type: ignore[assignment]
+    assert not control.connected
+
+    calls = []
+    control.ensure_connected = lambda force=False: calls.append(force)  # type: ignore[method-assign]
+    control._send(b"z")
+
+    assert calls == [False]
+
+
+def test_reconnect_restarts_the_server_even_within_the_cooldown():
+    control = ScrcpyControl()
+    calls = []
+    control.close = lambda: calls.append("close")   # type: ignore[method-assign]
+    control.start = lambda: calls.append("start")   # type: ignore[method-assign]
+
+    control.reconnect()
+
+    assert calls == ["close", "start"]
+
+
+def test_a_gesture_never_reconnects_underneath_itself():
+    control = ScrcpyControl()
+    control.sock = None
+    ensures = []
+    control.ensure_connected = lambda force=False: ensures.append(force)  # type: ignore[method-assign]
+
+    with pytest.raises(ScrcpyError):
+        control.pinch(500, 700, 280, 70, steps=2, duration_ms=0)
+
+    assert ensures == []
+    assert control._auto_reconnect is True
+
+
+def test_a_broken_gesture_still_restores_auto_reconnect():
+    control = ScrcpyControl()
+    control.sock = _GoodSocket()
+    packets = []
+
+    def send(packet):
+        packets.append(packet)
+        if len(packets) == 3:              # two DOWNs + one MOVE worked
+            control.sock = None
+            raise ScrcpyError("phone went away")
+
+    control._send = send                    # type: ignore[method-assign]
+
+    with pytest.raises(ScrcpyError):
+        control.pinch(500, 700, 280, 70, steps=4, duration_ms=0)
+
+    assert control._auto_reconnect is True
+    assert control.sock is None

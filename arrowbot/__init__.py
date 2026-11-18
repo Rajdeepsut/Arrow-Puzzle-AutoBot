@@ -5,6 +5,7 @@ Modules
 config   : dataclass configuration, JSON load/save
 solver   : pure ray-casting solver (no dependencies, unit-testable)
 vision   : screen -> board model (OpenCV)
+counter  : HUD remaining-arrow count, used as a second opinion
 adb      : thin ADB wrapper (screencap / tap)
 agent    : the level loop that ties everything together
 sim      : synthetic "phone" used by the self-test

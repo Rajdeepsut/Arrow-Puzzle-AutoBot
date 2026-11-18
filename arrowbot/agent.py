@@ -33,7 +33,7 @@ from typing import List, Optional, Protocol, Sequence, Tuple
 import cv2
 import numpy as np
 
-from . import solver
+from . import counter, solver
 from .config import Config
 from .vision import Arrow, Detection, Detector, fractions_to_box, render_overlay
 
@@ -380,6 +380,41 @@ class ArrowAgent:
         self._hearts_seen = max(self._hearts_seen, red)
         return True, red
 
+    # ---------------------------------------------------------------- counter
+    def read_counter(self, image: np.ndarray) -> Optional[int]:
+        """The HUD's remaining-arrow count, or ``None`` if it is unreadable."""
+        if not self.config.counter_check:
+            return None
+        return counter.read_counter(image, self.config.counter_roi,
+                                    self.config.counter_min_score)
+
+    def settle_counter(self, detection: Detection,
+                       retries: Optional[int] = None) -> Tuple[Detection, bool]:
+        """Wait out a removal/count-up animation before trusting the board.
+
+        Returns the newest detection and whether the HUD count and the detected
+        arrows agree.  An unreadable HUD counts as agreement: the check is a
+        bonus, never a prerequisite, so an unknown font cannot stop the run.
+        """
+        if detection is None or not self.config.counter_check:
+            return detection, True
+        retries = self.config.counter_retries if retries is None else retries
+        for attempt in range(retries + 1):
+            hud = self.read_counter(detection.image)
+            if hud is None or hud == len(detection.arrows):
+                if hud is not None:
+                    self.log.debug("HUD count agrees (%d arrows)", hud)
+                return detection, True
+            self.log.debug("HUD says %d arrows, %d were read (attempt %d/%d)",
+                           hud, len(detection.arrows), attempt + 1, retries + 1)
+            if attempt >= retries:
+                break
+            self._sleep(max(0.0, self.config.counter_wait_ms / 1000.0))
+            fresh = self.detect_once(retries=1)
+            if fresh is not None:
+                detection = fresh
+        return detection, False
+
     # -------------------------------------------------------------- the board
     def candidates(self, detection: Detection) -> List[Arrow]:
         """Safe arrows that the bot is confident about, best first."""
@@ -578,6 +613,16 @@ class ArrowAgent:
             self.report_plan(detection, self.candidates(detection), level)
             return "dryrun"
 
+        # The HUD count is an independent read of the same board.  A mismatch
+        # is usually a removal/count-up animation still running, so wait it out;
+        # if it survives, the reading cannot be trusted enough for batch taps.
+        detection, counter_ok = self.settle_counter(detection)
+        if detection is None:
+            return "unstable"
+        if not counter_ok:
+            self.log.warning("HUD count still disagrees -> one tap per screenshot")
+            return self.play_level_slow(level, dry_run=dry_run, initial=detection)
+
         if not self.all_tappable(detection):
             self.log.warning("some arrows are uncertain or at the screen edge -> "
                              "using one tap per screenshot for this level")
@@ -632,6 +677,14 @@ class ArrowAgent:
                 return "error"
             detection = after
             batch_index += 1
+
+            # A batch removes several arrows at once.  Wait until the HUD count
+            # and the board agree so the next plan is built on a settled frame.
+            detection, counter_ok = self.settle_counter(detection)
+            if not counter_ok:
+                self.log.warning("HUD count disagrees after batch %d - "
+                                 "one tap per screenshot from here", batch_index)
+                batch_limit = 1
 
             hearts_ok, red = self.check_hearts(detection.image)
             if not hearts_ok:

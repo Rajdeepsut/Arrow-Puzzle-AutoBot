@@ -114,6 +114,20 @@ class Config:
     #: ink this close to the edge of the board region counts as clipped
     zoom_edge_px: int = 3
 
+    # ---------------------------------------------------------------- counter
+    #: cross-check the detected arrows against the HUD's remaining-arrow count;
+    #: a disagreement only slows the level down, it never stops the run
+    counter_check: bool = True
+    #: the counter pill, as screen fractions (left, top, right, bottom)
+    counter_roi: List[float] = field(
+        default_factory=lambda: [0.02, 0.09, 0.20, 0.126]
+    )
+    #: extra reads while a removal/count-up animation is still finishing
+    counter_retries: int = 2
+    counter_wait_ms: int = 150
+    #: minimum glyph/template agreement; below this the HUD is "unreadable"
+    counter_min_score: float = 0.82
+
     # -------------------------------------------------------------- level flow
     #: hard stop for one level (safety valve, not a normal limit)
     max_waves_per_level: int = 400
@@ -238,6 +252,13 @@ class Config:
         self.zoom_edge_px = max(0, int(self.zoom_edge_px))
         if self.input_backend not in ("scrcpy", "adb"):
             self.input_backend = "scrcpy"
+
+        self.counter_check = bool(self.counter_check)
+        self.counter_roi = _fraction_box(
+            self.counter_roi, [0.02, 0.09, 0.20, 0.126])
+        self.counter_retries = max(0, int(self.counter_retries))
+        self.counter_wait_ms = max(0, int(self.counter_wait_ms))
+        self.counter_min_score = float(min(1.0, max(0.0, self.counter_min_score)))
 
         self.max_levels = max(1, int(self.max_levels))
         self.max_waves_per_level = max(1, int(self.max_waves_per_level))

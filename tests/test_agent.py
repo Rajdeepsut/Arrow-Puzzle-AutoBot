@@ -305,3 +305,33 @@ def test_a_popup_that_hides_the_board_is_not_a_new_level():
     started = time.monotonic()
     assert agent.advance_level() is None
     assert time.monotonic() - started < 2.0
+
+
+def test_a_mismatched_hud_falls_back_to_one_tap_per_screenshot():
+    config = _config(1)
+    game = SimGame(config, cols=9, rows=11, seed=5)
+    agent = ArrowAgent(config, game, logger=_logger())
+    calls = []
+
+    def slow(level=0, dry_run=False, initial=None):
+        calls.append((level, len(initial.arrows) if initial else 0))
+        return "cleared"
+
+    agent.play_level_slow = slow                 # type: ignore[method-assign]
+    agent.read_counter = lambda image: 999       # type: ignore[method-assign]
+
+    assert agent.play_level_fast(level=1) == "cleared"
+    assert calls and calls[0][0] == 1 and calls[0][1] > 0
+
+
+def test_an_unreadable_hud_never_slows_the_fast_path():
+    config = _config(1)
+    game = SimGame(config, cols=9, rows=11, seed=6)
+    agent = ArrowAgent(config, game, logger=_logger())
+    agent.read_counter = lambda image: None      # type: ignore[method-assign]
+
+    detection = agent.read_stable()
+    assert detection is not None and detection.arrows
+    settled, agreed = agent.settle_counter(detection)
+    assert agreed is True
+    assert settled is not None

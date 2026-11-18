@@ -1,22 +1,20 @@
-﻿"""End-to-end self-test: needs no phone, no game install, no assets.
+﻿"""End-to-end self-test: needs no phone, no game install, no network.
 
-Four things are checked:
-
-1. the corridor rules on hand-built pixel arrows,
-2. the vision pipeline against synthetic boards it has never seen (several board
-   sizes, dark ink, red ink, a zoomed camera, one arrow left),
-3. the full agent loop against :class:`arrowbot.sim.SimGame`, asserting that the
-   bot *never lost a heart* and did advance to the next level,
-4. that a board which never stops moving is never tapped.
+It checks the corridor rules, the vision pipeline on synthetic and real
+captures, the HUD remaining-arrow counter, the scrcpy wire format, the full
+agent loop against :class:`arrowbot.sim.SimGame` (never losing a heart), and
+that a board which never stops moving is never tapped.
 """
 
 from __future__ import annotations
 
 import logging
+import pathlib
 import struct
 import time
 from typing import List, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 from . import solver
@@ -395,7 +393,25 @@ def test_recovery(rep: Reporter, levels: int = 1) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 4. the scrcpy wire format (no phone needed)
+# 5. the HUD remaining-arrow counter (real captures, no phone needed)
+# --------------------------------------------------------------------------- #
+def test_counter(rep: Reporter) -> None:
+    from .counter import read_counter
+
+    samples = pathlib.Path(__file__).resolve().parents[1] / "samples"
+    for name, expected in (("real_level.png", 56),
+                           ("real_level_74.png", 74),
+                           ("real_level_zoomed.png", 78)):
+        image = cv2.imread(str(samples / name))
+        got = read_counter(image) if image is not None else None
+        rep.check(f"HUD counter reads {expected} on {name}", got == expected,
+                  f"read {got}")
+    blank = np.full((300, 600, 3), 255, np.uint8)
+    rep.check("a blank HUD is not guessed", read_counter(blank) is None)
+
+
+# --------------------------------------------------------------------------- #
+# 6. the scrcpy wire format (no phone needed)
 # --------------------------------------------------------------------------- #
 def test_scrcpy_packets(rep: Reporter) -> None:
     import struct
@@ -430,7 +446,7 @@ def test_scrcpy_packets(rep: Reporter) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 5. a board that never settles must never be tapped
+# 7. a board that never settles must never be tapped
 # --------------------------------------------------------------------------- #
 class _JitteringDevice:
     def __init__(self, image: np.ndarray):
@@ -473,6 +489,8 @@ def run(levels: int = 3, verbose: bool = True) -> bool:
     test_zoom_out(rep)
     print("agent with changing board sizes")
     test_board_changes(rep)
+    print("HUD counter (real captures)")
+    test_counter(rep)
     print("recovery (popups, menus, raw capture)")
     test_recovery(rep)
     print("scrcpy control protocol")

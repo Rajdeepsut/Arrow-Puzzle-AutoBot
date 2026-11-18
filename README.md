@@ -70,6 +70,19 @@ batch to one tap per screenshot. This catches a panned or zoomed camera, a lost
 heart, a stalled tap, or a popup. The simulator is harsher than the real game -
 it zooms in on every removal - and this scheme clears it without losing a heart.
 
+## The HUD counter is a second opinion
+
+The top-left pill shows how many arrows the game thinks are left. The bot reads
+that number with ten small glyph templates and compares it with its own
+detection. When a removal or count-up animation is still running the two
+disagree, so the bot waits a moment and re-reads. If the disagreement survives,
+the plan is not trusted enough for batch taps and the level drops to **one tap
+per screenshot** - slower, never a dead end. On all saved real frames (56, 74
+and 78-arrow boards) the counter and the detected count agree exactly.
+
+An unreadable counter is ignored rather than guessed: the check can only slow
+the bot down, never stop it.
+
 ## Recovery: it never stops on one bad level
 
 A real level is always solvable, so a deadlock in the detected board almost
@@ -133,12 +146,13 @@ Verify the install - no phone needed:
 python main.py selftest
 ```
 
-`selftest` runs 60 checks: the corridor rules and deadlock repair, detection
-against synthetic screens of several sizes (navy, red, zoomed), the zoom-out
-logic, the full fast agent loop (never loses a heart, advances to the next
-level, under a minute per level), popup/menu recovery, raw screencap decoding,
-the next-board stability check, the scrcpy 32-byte packet format, and a moving
-board that must never be tapped.
+`selftest` runs 64 checks: the corridor rules and deadlock repair, detection
+against synthetic screens of several sizes (navy, red, zoomed), the HUD
+remaining-arrow counter on real captures, the zoom-out logic, the full fast
+agent loop (never loses a heart, advances to the next level, under a minute per
+level), popup/menu recovery, raw screencap decoding, the next-board stability
+check, the scrcpy 32-byte packet format, and a moving board that must never be
+tapped.
 
 ## Validate on the real phone
 
@@ -196,7 +210,7 @@ If anything unusual happens, an annotated image is written to `debug/`
 
 | command | what it does |
 | --- | --- |
-| `python main.py selftest` | rules + vision + zoom + fast agent, no phone |
+| `python main.py selftest` | rules + vision + HUD counter + zoom + fast agent, no phone |
 | `python main.py devices` | list ADB devices |
 | `python main.py shot [--image file.png]` | detect one frame and save `debug/shot.png` |
 | `python main.py run` | play levels: fast mode, scrcpy input, auto zoom-out |
@@ -267,6 +281,10 @@ unknown keys are ignored, so old files keep working.
 | `tap_retries` | `2` | taps without effect before the attempt is failed |
 | `hearts_roi` | `[0.31, 0.095, 0.72, 0.132]` | strip that shows the hearts |
 | `hearts_min_red` | `300` | fewer red pixels means the HUD is hidden |
+| `counter_check` | `true` | compare detected arrows with the HUD count |
+| `counter_roi` | `[0.02, 0.09, 0.20, 0.126]` | the remaining-arrow pill |
+| `counter_retries` / `counter_wait_ms` | `2` / `150` | wait for count-up/removal animations |
+| `counter_min_score` | `0.82` | below this the HUD is "unreadable", not guessed |
 | `edge_margin_px` | `18` | arrows closer to the screen edge fall back to slow mode |
 | `max_waves_per_level` | `400` | safety valve for one level |
 | `advance_timeout_ms` | `15000` | max wait for the next settled board |
@@ -341,14 +359,17 @@ config.json               editable defaults
 arrowbot/
   solver.py               corridor geometry, greedy planner, deadlock repair
   vision.py               ink mask, arrow heads, direction templates
+  counter.py              HUD remaining-arrow count (glyph templates)
+  counter_templates.py    generated 20x32 digit templates
   agent.py                zoom-out, fast batches, heart/stall/recovery loop
   adb.py                  raw screenshots, adb fallback input, UI dump, app restart
   scrcpy.py               scrcpy server lifecycle + multi-touch protocol
   sim.py                  synthetic phone (boards, camera zoom, hearts)
-  selftest.py             60 end-to-end checks, no phone needed
-tests/                    pytest: solver, vision/zoom, scrcpy packets, agent
+  selftest.py             64 end-to-end checks, no phone needed
+tests/                    pytest: solver, vision/zoom, HUD counter, scrcpy, agent
 tools/device_test.py      live zoom/tap/drift check + recovery smoke test
 tools/soak.py             N-level simulator run with production defaults
+tools/build_counter_templates.py  rebuild the HUD digit templates from captures
 samples/sample_board.png  synthetic screenshot for `shot --image`
 samples/real_level*.png   real device captures used as vision regressions
 .github/workflows/ci.yml  lint + tests + selftest on Python 3.9/3.11/3.12/3.13

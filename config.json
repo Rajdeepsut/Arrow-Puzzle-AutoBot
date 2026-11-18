@@ -61,6 +61,16 @@
   "zoom_attempts": 3,
   "zoom_settle_ms": 300,
   "zoom_edge_px": 3,
+  "counter_check": true,
+  "counter_roi": [
+    0.02,
+    0.09,
+    0.2,
+    0.126
+  ],
+  "counter_retries": 2,
+  "counter_wait_ms": 150,
+  "counter_min_score": 0.82,
   "max_waves_per_level": 400,
   "advance_timeout_ms": 15000,
   "advance_attempts": 6,

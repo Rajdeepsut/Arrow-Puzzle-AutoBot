@@ -140,6 +140,21 @@ level, under a minute per level), popup/menu recovery, raw screencap decoding,
 the next-board stability check, the scrcpy 32-byte packet format, and a moving
 board that must never be tapped.
 
+## Validate on the real phone
+
+```bash
+python tools/device_test.py --no-tap     # zoom + read only, no touch
+python tools/device_test.py              # taps 3 planned-safe arrows, measures drift
+python tools/device_test.py --taps 6     # longer batch, same provable order
+python tools/device_test.py --recovery   # UI dump + force-stop/relaunch smoke test
+python tools/soak.py --levels 20         # no phone: production defaults, 20 levels
+```
+
+`device_test` takes its taps from the solver's own clear order, so a lost heart
+means the pixel model or the camera moved. It writes before/after frames to
+`debug/`. `soak` runs the full agent against the synthetic phone and prints
+per-level seconds, hearts, retries and restarts.
+
 ## Quick start
 
 ```bash
@@ -332,6 +347,8 @@ arrowbot/
   sim.py                  synthetic phone (boards, camera zoom, hearts)
   selftest.py             60 end-to-end checks, no phone needed
 tests/                    pytest: solver, vision/zoom, scrcpy packets, agent
+tools/device_test.py      live zoom/tap/drift check + recovery smoke test
+tools/soak.py             N-level simulator run with production defaults
 samples/sample_board.png  synthetic screenshot for `shot --image`
 samples/real_level*.png   real device captures used as vision regressions
 .github/workflows/ci.yml  lint + tests + selftest on Python 3.9/3.11/3.12/3.13

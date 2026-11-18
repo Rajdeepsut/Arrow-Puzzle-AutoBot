@@ -25,13 +25,20 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # The runner image already ships an Android SDK and sdkmanager on PATH.
-      # (android-actions/setup-android@v3 now fails: it installs the removed
-      # "tools" package.)
+      # The runner image already ships an Android SDK; find its sdkmanager
+      # instead of using android-actions/setup-android@v3 (which now fails
+      # installing the removed legacy "tools" package).
       - name: Install Android SDK 35
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f -print -quit 2>/dev/null || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          test -n "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:

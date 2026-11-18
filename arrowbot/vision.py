@@ -288,6 +288,8 @@ class Arrow:
     scale: float
     xs: np.ndarray
     ys: np.ndarray
+    #: template score for every direction (used to repair a misread deadlock)
+    scores: Optional[Dict[str, float]] = None
 
     @property
     def cx(self) -> int:
@@ -356,13 +358,20 @@ class Detection:
 
 
 class Detector:
-    """Turns a screenshot into :class:`Detection`."""
+    """Turns a screenshot into :class:`Detection`.
 
-    def __init__(self, config=None):
+    ``overrides`` lets the agent try one recovery pass with slightly different
+    ink/head thresholds without copying the whole configuration.
+    """
+
+    def __init__(self, config=None, **overrides):
         self.config = config
+        self.overrides = dict(overrides)
 
     # ---------------------------------------------------------------- helpers
     def _knob(self, name: str, default):
+        if name in self.overrides:
+            return self.overrides[name]
         return getattr(self.config, name, default) if self.config is not None else default
 
     def ink(self, image: np.ndarray) -> np.ndarray:
@@ -409,9 +418,10 @@ class Detector:
                 xs, ys = parts[index]
                 if len(xs) < min_pixels:
                     continue
-                direction, _scores, margin = vote(own_patch(xs, ys, x, y, radius), options)
+                direction, scores, margin = vote(own_patch(xs, ys, x, y, radius), options)
                 arrows.append(Arrow(head=(x, y), direction=direction,
-                                    confidence=margin, scale=scale, xs=xs, ys=ys))
+                                    confidence=margin, scale=scale, xs=xs, ys=ys,
+                                    scores=scores))
         return arrows
 
 

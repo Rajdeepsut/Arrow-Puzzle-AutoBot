@@ -26,6 +26,13 @@ class Config:
     scrcpy_jar: Optional[str] = None
     scrcpy_port: int = 27183
     scrcpy_log_level: str = "error"
+    #: ``exec-out screencap`` raw pixels are much faster than PNG
+    raw_screencap: bool = True
+    #: wake the screen and keep it on while the bot plays
+    keep_awake: bool = True
+    #: used to relaunch the game after an unrecoverable overlay / stuck state
+    game_package: str = "com.easybrain.arrow.puzzle.game"
+    game_activity: str = "com.easybrain.template.TemplateActivity"
 
     # ------------------------------------------------------------------ vision
     #: region that may contain the board, as screen fractions
@@ -52,7 +59,7 @@ class Config:
     #: plan the whole board once, then tap a batch at a time (much faster)
     fast_mode: bool = True
     #: arrows per batch before the board is read and checked again
-    batch_size: int = 8
+    batch_size: int = 12
     #: first batch of a level; grows towards ``batch_size`` while the camera is still
     batch_size_start: int = 6
     #: a surviving arrow moving more than this between batches means the camera moved
@@ -64,18 +71,18 @@ class Config:
     #: how long each finger stays down for one arrow
     tap_hold_ms: int = 12
     #: pause after a batch, to let the removal animation finish
-    batch_wait_ms: int = 160
+    batch_wait_ms: int = 120
     #: taps before re-reading the board in slow mode.  The camera can move as
     #: soon as an arrow disappears, so slow mode never batches.
     chunk_size: int = 1
     #: pause between taps of one batch in slow mode
     tap_delay_ms: int = 0
     #: pause after a tap, before the board is read again
-    tap_wait_ms: int = 700
+    tap_wait_ms: int = 500
     #: screenshot interval while waiting for the camera to stop moving
-    settle_poll_ms: int = 140
+    settle_poll_ms: int = 90
     #: give up waiting for a stable board after this long
-    settle_timeout_ms: int = 5000
+    settle_timeout_ms: int = 6000
     #: two frames count as "the same view" when every head moved less than this
     stability_tol_px: int = 2
     #: check the tapped arrow is gone and no heart was lost
@@ -103,7 +110,7 @@ class Config:
     #: how many pinch gestures may be spent on one level
     zoom_attempts: int = 3
     #: wait after a pinch before the camera is read again
-    zoom_settle_ms: int = 450
+    zoom_settle_ms: int = 300
     #: ink this close to the edge of the board region counts as clipped
     zoom_edge_px: int = 3
 
@@ -111,18 +118,46 @@ class Config:
     #: hard stop for one level (safety valve, not a normal limit)
     max_waves_per_level: int = 400
     #: how long to wait for the next board after a level is cleared
-    advance_timeout_ms: int = 20000
+    advance_timeout_ms: int = 15000
     #: fallback taps allowed if the game shows a button instead of auto-advancing
     advance_attempts: int = 6
-    advance_wait_ms: int = 900
+    advance_wait_ms: int = 600
     #: fallback "next level" button positions, as screen fractions
     next_tap_points: List[List[float]] = field(
         default_factory=lambda: [[0.5, 0.86], [0.5, 0.80], [0.5, 0.91]]
     )
-    #: ``stop`` or ``tap_anyway`` (sacrifice a heart and keep playing)
-    on_deadlock: str = "stop"
-    #: keep going after a level that did not finish cleanly
-    continue_on_failure: bool = False
+    #: deadlock policy: ``repair`` (fix a misread direction), ``tap_anyway``
+    #: (sacrifice a heart as a last resort) or ``stop``
+    on_deadlock: str = "repair"
+    #: how many attempts on one level before a deliberate sacrifice is allowed
+    sacrifice_after_attempts: int = 2
+    #: hearts the bot may spend to unstick one level (0 = never)
+    max_sacrifices_per_level: int = 2
+    #: keep playing after a level that did not finish cleanly - never stop
+    continue_on_failure: bool = True
+    #: internal recovery attempts per level before the run loop restarts the app
+    max_level_attempts: int = 6
+    #: base backoff between recovery attempts
+    retry_wait_ms: int = 250
+    #: relaunch the game after this many consecutive failed attempts on a level
+    restart_after_failures: int = 4
+    restart_wait_ms: int = 2500
+    #: use uiautomator to find and press "Retry"/"Continue"/"Next" buttons
+    ui_recovery: bool = True
+    #: button labels the recovery path may press, highest priority first
+    ui_labels: List[str] = field(default_factory=lambda: [
+        "continue", "resume", "retry", "play", "next", "ok", "close",
+        "no thanks", "claim", "skip", "restart",
+    ])
+    #: blind taps for full-screen ads, used only when no board is on screen;
+    #: these are the screen corners outside the board region
+    overlay_tap_points: List[List[float]] = field(
+        default_factory=lambda: [[0.94, 0.08], [0.06, 0.08], [0.5, 0.96]]
+    )
+    #: home-screen "Continue Game" positions, screen fractions
+    home_tap_points: List[List[float]] = field(
+        default_factory=lambda: [[0.5, 0.744], [0.5, 0.86]]
+    )
 
     # --------------------------------------------------------------------- run
     max_levels: int = 500
@@ -152,7 +187,7 @@ class Config:
         return self
 
     def save(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(asdict(self), handle, indent=2)
             handle.write("\n")
 
@@ -209,15 +244,25 @@ class Config:
         self.advance_timeout_ms = max(100, int(self.advance_timeout_ms))
         self.advance_attempts = max(0, int(self.advance_attempts))
         self.advance_wait_ms = max(0, int(self.advance_wait_ms))
-        if self.on_deadlock not in ("stop", "tap_anyway"):
-            self.on_deadlock = "stop"
+        if self.on_deadlock not in ("repair", "tap_anyway", "stop"):
+            self.on_deadlock = "repair"
+        self.sacrifice_after_attempts = max(0, int(self.sacrifice_after_attempts))
+        self.max_sacrifices_per_level = max(0, int(self.max_sacrifices_per_level))
+        self.max_level_attempts = max(1, int(self.max_level_attempts))
+        self.retry_wait_ms = max(0, int(self.retry_wait_ms))
+        self.restart_after_failures = max(1, int(self.restart_after_failures))
+        self.restart_wait_ms = max(0, int(self.restart_wait_ms))
+        self.game_package = (self.game_package or "").strip()
+        self.game_activity = (self.game_activity or "").strip()
+        self.ui_labels = [str(label).strip().lower() for label in self.ui_labels or []
+                          if str(label).strip()]
 
-        points: List[List[float]] = []
-        for point in self.next_tap_points or []:
-            if len(point) == 2:
-                points.append([float(min(1.0, max(0.0, point[0]))),
-                               float(min(1.0, max(0.0, point[1])))])
-        self.next_tap_points = points or [[0.5, 0.86]]
+        self.next_tap_points = _fraction_points(
+            self.next_tap_points, [[0.5, 0.86]])
+        self.overlay_tap_points = _fraction_points(
+            self.overlay_tap_points, [[0.94, 0.08], [0.06, 0.08]])
+        self.home_tap_points = _fraction_points(
+            self.home_tap_points, [[0.5, 0.744]])
         return self
 
 
@@ -231,3 +276,14 @@ def _fraction_box(values, fallback: Optional[List[float]]) -> List[float]:
     if y1 - y0 < 0.01:
         y0, y1 = 0.0, 1.0
     return [x0, y0, x1, y1]
+
+
+def _fraction_points(values, fallback: List[List[float]]) -> List[List[float]]:
+    """Clamp a list of ``(x, y)`` screen fractions, keeping the fallback."""
+    points: List[List[float]] = []
+    for point in values or []:
+        if len(point) != 2:
+            continue
+        points.append([float(min(1.0, max(0.0, point[0]))),
+                       float(min(1.0, max(0.0, point[1])))])
+    return points or [list(point) for point in fallback]

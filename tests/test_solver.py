@@ -77,6 +77,57 @@ def test_the_corridor_scales_with_the_artwork():
     assert solver.is_safe(doubled, [doubled, near]) is False
 
 
+def test_repair_fixes_one_misread_direction():
+    """A deadlocked reading becomes clearable by turning one arrow outward."""
+    a = make_arrow((100, 100), "R")
+    b = make_arrow((200, 100), "D")
+    c = make_arrow((200, 200), "L")
+    d = make_arrow((100, 200), "U")
+    ring = [a, b, c, d]
+    assert solver.plan(ring) is None
+
+    fixes = solver.repair(ring)
+    assert fixes, "a one-direction repair should exist"
+    original = {arrow: arrow.direction for arrow in ring}
+    for arrow, direction in fixes.items():
+        arrow.direction = direction
+    try:
+        assert solver.clearable(ring)
+    finally:
+        for arrow, direction in original.items():
+            arrow.direction = direction
+
+
+def test_repair_leaves_a_clearable_board_alone():
+    chain = [make_arrow((300, 300 + PITCH * k), "U") for k in range(4)]
+    assert solver.repair(chain) == {}
+
+
+def test_repair_uses_template_scores_when_present():
+    """The true direction has the best score in this synthetic misread."""
+    front = make_arrow((300, 300), "U")       # really points up
+    back = make_arrow((300, 400), "U")
+    chain = [front, back]
+    assert solver.clearable(chain)
+
+    class Scored:
+        def __init__(self, arrow, direction, scores, confidence=0.04):
+            self.head = arrow.head
+            self.direction = direction
+            self.xs, self.ys = arrow.xs, arrow.ys
+            self.scale = arrow.scale
+            self.confidence = confidence
+            self.scores = scores
+
+    # the detector read the front arrow as down: now both arrows block each other
+    front_scored = Scored(front, "D", {"U": 0.62, "D": 0.55, "R": 0.10, "L": 0.05})
+    back_scored = Scored(back, "U", {"U": 0.90, "D": 0.05, "R": 0.03, "L": 0.02})
+    assert solver.plan([front_scored, back_scored]) is None
+
+    fixes = solver.repair([front_scored, back_scored])
+    assert fixes and fixes.get(front_scored) == "U"
+
+
 def test_order_taps_every_arrow_once_and_stays_safe():
     chain = [make_arrow((300, 300 + PITCH * k), "U") for k in range(6)]
     order = solver.order(chain)

@@ -93,7 +93,7 @@ def resolve_device(config: Config, logger: logging.Logger) -> None:
 
 def open_device(config: Config, logger: logging.Logger):
     """Return ``(device, closer)``; prefers scrcpy for fast multi-touch input."""
-    adb = Adb(config.adb_path, config.serial)
+    adb = Adb(config.adb_path, config.serial, raw=config.raw_screencap)
     if config.input_backend != "scrcpy":
         logger.info("input: adb shell (slow, single finger)")
         return adb, (lambda: None)
@@ -171,7 +171,8 @@ def cmd_shot(args, config, logger) -> int:
         source = args.image
     else:
         resolve_device(config, logger)
-        image = Adb(config.adb_path, config.serial).screencap()
+        image = Adb(config.adb_path, config.serial,
+                    raw=config.raw_screencap).screencap()
         source = f"device {config.serial}"
 
     detector = Detector(config)

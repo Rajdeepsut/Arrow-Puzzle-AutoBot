@@ -13,12 +13,14 @@ Four things are checked:
 from __future__ import annotations
 
 import logging
+import struct
 import time
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from . import solver
+from .adb import Adb, UiNode
 from .agent import ArrowAgent
 from .config import Config
 from .sim import PITCH, SimArrow, SimGame, arrow_mask
@@ -118,6 +120,17 @@ def test_rules(rep: Reporter) -> None:
     near = make_arrow((300 + 10, 300 - 2 * PITCH), "U")
     rep.check("the corridor scales with the artwork",
               solver.is_safe(doubled, [doubled, near]) is False)
+
+    # a deadlocked reading is repaired by flipping one misread direction
+    fixes = solver.repair(ring)
+    rep.check("a deadlock has a one-direction repair", bool(fixes), str(fixes))
+    original = {arrow: arrow.direction for arrow in ring}
+    for arrow, direction in (fixes or {}).items():
+        arrow.direction = direction
+    repaired = solver.clearable(ring)
+    for arrow, direction in original.items():
+        arrow.direction = direction
+    rep.check("the repaired board clears", repaired)
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +292,109 @@ def test_board_changes(rep: Reporter, levels: int = 3) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 4. recovery: popups, menus, unstable next boards, raw capture
+# --------------------------------------------------------------------------- #
+class _OverlaySim(SimGame):
+    """A board hidden behind a one-button popup."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.popup = True
+        self.dismissed = 0
+        self.button = (int(self.width * 0.28), int(self.height * 0.45),
+                       int(self.width * 0.72), int(self.height * 0.56))
+
+    def find_text(self, patterns):
+        if self.popup and any("continue" in pattern for pattern in patterns):
+            return [UiNode("CONTINUE", "", self.button, clickable=True)]
+        return []
+
+    def tap(self, x: int, y: int) -> None:
+        if self.popup:
+            x0, y0, x1, y1 = self.button
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                self.popup = False
+                self.dismissed += 1
+            return
+        super().tap(x, y)
+
+
+class _MenuSim(SimGame):
+    """Starts on a blank menu; the blind "Continue Game" tap opens the board."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.menu = True
+        self.menu_taps = 0
+
+    def screencap(self) -> np.ndarray:
+        if not self.menu:
+            return super().screencap()
+        image = np.empty((self.height, self.width, 3), np.uint8)
+        image[:] = self.background
+        return image
+
+    def tap(self, x: int, y: int) -> None:
+        if self.menu:
+            if (abs(x - 0.5 * self.width) < 0.2 * self.width
+                    and abs(y - 0.744 * self.height) < 0.06 * self.height):
+                self.menu = False
+                self.menu_taps += 1
+            return
+        super().tap(x, y)
+
+
+def test_recovery(rep: Reporter, levels: int = 1) -> None:
+    # a popup button is found through uiautomator and pressed once
+    cfg = _fast_config(levels)
+    cfg.ui_labels = ["continue", "retry"]
+    overlay = _OverlaySim(cfg, cols=9, rows=11, seed=51)
+    agent = ArrowAgent(cfg, overlay, logger=_quiet_logger())
+    agent._frame_shape = (overlay.height, overlay.width)
+    rep.check("a popup button is dismissed",
+              agent.dismiss_overlays() is True and overlay.dismissed == 1)
+    rep.check("a dismissed popup is not pressed again",
+              agent.dismiss_overlays() is False)
+
+    # a blank menu is recovered with a blind "Continue Game" tap, then the level
+    # is replayed - never skipped
+    cfg = _fast_config(levels)
+    cfg.max_level_attempts = 1
+    cfg.retry_wait_ms = 0
+    menu = _MenuSim(cfg, cols=9, rows=11, seed=21)
+    agent = ArrowAgent(cfg, menu, logger=_quiet_logger())
+    stats = agent.run()
+    rep.check("a menu is dismissed and the level is replayed",
+              stats.levels_cleared == levels and menu.menu_taps == 1,
+              stats.summary())
+    rep.check("recovering a menu loses no heart", menu.lives_lost == 0,
+              f"{menu.lives_lost} wrong taps")
+
+    # the screenshot that reveals the next level can catch it mid-animation
+    cfg = _fast_config(1)
+    cfg.settle_timeout_ms = 250
+    game = SimGame(cfg, cols=9, rows=10, seed=41)
+    detector = Detector(cfg)
+    candidate = detector.detect(game.screencap())
+    settled_agent = ArrowAgent(cfg, game, logger=_quiet_logger())
+    rep.check("a settled next board is accepted",
+              settled_agent._stable_next_board(candidate) is not None)
+
+    moving_agent = ArrowAgent(cfg, _JitteringDevice(game.screencap()),
+                              logger=_quiet_logger())
+    rep.check("an animating next board is not used",
+              moving_agent._stable_next_board(candidate) is None)
+
+    # raw screencap pixels decode to BGR without any PNG step
+    raw = struct.pack("<IIII", 2, 2, 1, 0) + bytes([255, 0, 0, 255]) * 4
+    frame = Adb._decode_raw(raw)
+    rep.check("raw screencap decodes to BGR",
+              frame is not None and frame.shape == (2, 2, 3)
+              and tuple(int(v) for v in frame[0, 0]) == (0, 0, 255),
+              "decoder returned %s" % (None if frame is None else str(frame.shape)))
+
+
+# --------------------------------------------------------------------------- #
 # 4. the scrcpy wire format (no phone needed)
 # --------------------------------------------------------------------------- #
 def test_scrcpy_packets(rep: Reporter) -> None:
@@ -357,6 +473,8 @@ def run(levels: int = 3, verbose: bool = True) -> bool:
     test_zoom_out(rep)
     print("agent with changing board sizes")
     test_board_changes(rep)
+    print("recovery (popups, menus, raw capture)")
+    test_recovery(rep)
     print("scrcpy control protocol")
     test_scrcpy_packets(rep)
     print("a board that keeps moving")

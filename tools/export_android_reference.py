@@ -12,9 +12,12 @@ proves the Java port still reads real screenshots the same way.
 from __future__ import annotations
 
 import os
+import struct
 import sys
+import zlib
 
 import cv2
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,7 +26,23 @@ from arrowbot.config import Config  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLES = ("real_level.png", "real_level_74.png", "real_level_zoomed.png")
-OUT = os.path.join(ROOT, "android", "app", "src", "test", "resources", "reference.tsv")
+RESOURCES = os.path.join(ROOT, "android", "app", "src", "test", "resources")
+OUT = os.path.join(RESOURCES, "reference.tsv")
+
+
+def write_frame(image, path: str) -> int:
+    """Write raw ARGB pixels as zlib, so the JUnit test needs no AWT."""
+    height, width = image.shape[:2]
+    blue = image[:, :, 0].astype(np.uint32)
+    green = image[:, :, 1].astype(np.uint32)
+    red = image[:, :, 2].astype(np.uint32)
+    argb = (0xFF000000 | (red << 16) | (green << 8) | blue).astype("<u4")
+    payload = zlib.compress(argb.tobytes(), 9)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(struct.pack("<II", width, height))
+        handle.write(payload)
+    return len(payload)
 
 
 def main() -> int:
@@ -36,6 +55,9 @@ def main() -> int:
         image = cv2.imread(path)
         if image is None:
             raise SystemExit(f"cannot read {path}")
+        fixture = os.path.join(RESOURCES, "samples",
+                               os.path.splitext(name)[0] + ".argb.z")
+        fixture_size = write_frame(image, fixture)
         mask = detector.ink(image)
         # the APK uses an exact Euclidean distance transform, so the reference
         # must be made with OpenCV's precise transform too (not the 5x5 mask)
@@ -58,7 +80,8 @@ def main() -> int:
                 f"{arrow.confidence:.6f}",
             ]))
         print(f"{name}: {count} arrows, counter={value}, "
-              f"{len(waves)} waves, scale={scale:.4f}")
+              f"{len(waves)} waves, scale={scale:.4f}, "
+              f"frame fixture {fixture_size} bytes")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     with open(OUT, "w", encoding="utf-8", newline="\n") as handle:

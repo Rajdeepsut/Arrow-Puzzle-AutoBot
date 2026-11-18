@@ -129,7 +129,10 @@ cd android && gradle :app:testDebugUnitTest
 `reference.tsv` and `DigitTemplates.java` are generated files; do not edit them
 by hand. The test expects 208 arrows across `real_level.png`,
 `real_level_74.png` and `real_level_zoomed.png`, with exact head coordinates,
-directions, scales, bounding boxes, HUD values and complete safe plans.
+directions, scales, bounding boxes, HUD values and complete safe plans. The
+frames themselves are stored as zlib-compressed raw pixels (`*.argb.z`) so the
+JUnit test does not need AWT, which is absent from the Android unit-test boot
+classpath.
 
 ## Layout
 

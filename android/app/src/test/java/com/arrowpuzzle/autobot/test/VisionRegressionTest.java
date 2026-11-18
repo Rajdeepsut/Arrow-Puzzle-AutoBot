@@ -9,8 +9,6 @@ import com.arrowpuzzle.autobot.core.Frame;
 import com.arrowpuzzle.autobot.core.Solver;
 import org.junit.Test;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -42,13 +40,15 @@ public class VisionRegressionTest {
         int checked = 0;
         for (Map.Entry<String, Expected> entry : expected.entrySet()) {
             Expected want = entry.getValue();
-            BufferedImage image = ImageIO.read(required("/samples/" + entry.getKey()));
-            assertNotNull(entry.getKey(), image);
-            Frame frame = new Frame(image.getWidth(), image.getHeight());
-            image.getRGB(0, 0, frame.width, frame.height, frame.pixels, 0, frame.width);
+            String label = entry.getKey();
+            String fixture = label.substring(0, label.length() - ".png".length())
+                    + ".argb.z";
+            Frame frame;
+            try (InputStream stream = required("/samples/" + fixture)) {
+                frame = TestFrames.load(stream);
+            }
 
             Detection detection = detector.detect(frame);
-            String label = entry.getKey();
             assertEquals(label + " arrow count", want.count, detection.arrows.size());
             assertEquals(label + " scale", want.scale, detection.scale, 0.05f);
             assertEquals(label + " left edge", want.x0, detection.x0, 2);

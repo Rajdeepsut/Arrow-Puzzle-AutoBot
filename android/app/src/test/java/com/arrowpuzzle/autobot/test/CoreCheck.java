@@ -8,9 +8,8 @@ import com.arrowpuzzle.autobot.core.Detector;
 import com.arrowpuzzle.autobot.core.Frame;
 import com.arrowpuzzle.autobot.core.Solver;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -30,7 +29,7 @@ public final class CoreCheck {
 
     public static void main(String[] args) throws Exception {
         File root = new File(args.length > 0 ? args[0] : "..");
-        File samples = new File(root, "samples");
+        File samples = new File(root, "android/app/src/test/resources/samples");
         File reference = new File(root,
                 "android/app/src/test/resources/reference.tsv");
         Map<String, Expected> expected = readReference(reference);
@@ -40,9 +39,13 @@ public final class CoreCheck {
         for (Map.Entry<String, Expected> entry : expected.entrySet()) {
             String name = entry.getKey();
             Expected want = entry.getValue();
-            BufferedImage image = ImageIO.read(new File(samples, name));
-            Frame frame = new Frame(image.getWidth(), image.getHeight());
-            image.getRGB(0, 0, frame.width, frame.height, frame.pixels, 0, frame.width);
+            String fixture = name.substring(0, name.length() - ".png".length())
+                    + ".argb.z";
+            Frame frame;
+            try (InputStream stream = Files.newInputStream(
+                    new File(samples, fixture).toPath())) {
+                frame = TestFrames.load(stream);
+            }
             long started = System.nanoTime();
             Detection detection = detector.detect(frame);
             long millis = (System.nanoTime() - started) / 1_000_000;

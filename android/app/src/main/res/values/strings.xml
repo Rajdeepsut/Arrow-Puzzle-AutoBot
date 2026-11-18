@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Arrow AutoBot</string>
+    <string name="accessibility_service_name">Arrow AutoBot gestures</string>
+    <string name="accessibility_description">Lets Arrow AutoBot tap and pinch inside Arrow Puzzle. It never reads your keystrokes, passwords or personal data.</string>
+    <string name="notification_channel">AutoBot status</string>
+    <string name="notification_channel_description">Shows whether the bot is playing and lets you stop it.</string>
+    <string name="notification_title">Arrow AutoBot</string>
+    <string name="notification_stop">Stop</string>
+    <string name="start">Start bot</string>
+    <string name="stop">Stop</string>
+    <string name="open_game">Open game</string>
+    <string name="accessibility">Accessibility</string>
+    <string name="battery">Battery</string>
+    <string name="not_set">Not set</string>
+    <string name="enabled">Enabled</string>
+    <string name="disabled">Not enabled</string>
+    <string name="active">Active</string>
+    <string name="inactive">Inactive</string>
+    <string name="unrestricted">Unrestricted</string>
+    <string name="optimized">Optimized</string>
+    <string name="open_after_start">Open Arrow Puzzle after starting</string>
+    <string name="instructions">1. Enable the accessibility service.\n2. Open Arrow Puzzle and leave it on a level.\n3. Tap Start bot and accept screen capture.\n\nThe bot plays only while Arrow Puzzle is in the foreground. Every tap is checked against the live board first; if anything is unclear it slows down to one tap per screenshot instead of guessing. Keep the notification running while you play.</string>
+    <string name="how_title">How it works</string>
+    <string name="permissions_title">Setup</string>
+    <string name="status_title">Status</string>
+    <string name="start_hint">Nothing is tapped until a stable board is detected.</string>
+    <string name="accessibility_dialog_title">Accessibility is off</string>
+    <string name="accessibility_dialog_message">Android needs the Arrow AutoBot accessibility service to send taps. It only performs gestures; it does not read passwords or personal data.</string>
+    <string name="open_settings">Open settings</string>
+    <string name="cancel">Cancel</string>
+    <string name="capture_cancelled">Screen capture was not allowed.</string>
+    <string name="game_missing">Arrow Puzzle is not installed.</string>
+    <string name="already_running">The bot is already running.</string>
+    <string name="notification_permission">Allow notifications so the bot can show its Stop button.</string>
+</resources>

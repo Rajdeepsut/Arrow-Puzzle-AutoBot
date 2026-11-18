@@ -16,6 +16,20 @@ The goal is **seconds per level with no stalls** - in practice, a level takes a
 few seconds of tapping once the page has loaded, and every failure path is
 retried instead of stopping the run.
 
+## Standalone APK (no PC)
+
+`android/` contains a self-contained APK that runs the same vision, solver,
+HUD-counter and level loop natively on the phone: `MediaProjection` for capture,
+`AccessibilityService` gestures for taps, no root, no ADB, no PC. It reads the
+same board region, applies the same corridor safety rule, batches up to 10 taps
+per gesture (Android's limit) and falls back to one tap per screenshot whenever
+the counter, hearts, camera drift or board edges are uncertain. The Java core
+is tested against the Python pipeline on the three real captures, so both bots
+agree arrow-for-arrow.
+
+Build/download it from the **android** workflow artifact and see
+[`android/README.md`](android/README.md) for install, permissions and tuning.
+
 ```
      screenshot (adb exec-out screencap, raw pixels; PNG fallback)
                     |
@@ -372,7 +386,9 @@ tools/soak.py             N-level simulator run with production defaults
 tools/build_counter_templates.py  rebuild the HUD digit templates from captures
 samples/sample_board.png  synthetic screenshot for `shot --image`
 samples/real_level*.png   real device captures used as vision regressions
+android/                  standalone APK: Java core, capture, gestures, UI
 .github/workflows/ci.yml  lint + tests + selftest on Python 3.9/3.11/3.12/3.13
+.github/workflows/android.yml  JVM regression test + debug APK artifact
 ```
 
 ## Tests
@@ -382,6 +398,7 @@ ruff check .
 python -m pytest -q
 python main.py selftest
 python main.py shot --image samples/sample_board.png
+cd android && gradle :app:testDebugUnitTest   # Java core on the real frames
 ```
 
 ## License
